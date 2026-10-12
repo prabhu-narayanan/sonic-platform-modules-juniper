@@ -46,7 +46,7 @@ except ImportError as e:
 class Platform(PlatformBase):
     """
     Juniper Platform-specific class
-    """	
+    """
     def __init__(self):
-	PlatformBase.__init__(self)
-        self._chassis = Chassis()	
+        PlatformBase.__init__(self)
+        self._chassis = Chassis()

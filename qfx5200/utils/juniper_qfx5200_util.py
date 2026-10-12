@@ -215,12 +215,12 @@ def main():
     for x in range(PWMINPUT_NUM):
          hwmon_input_path_mapping[x] = HWMONINPUT_PATH.format(hwmon_input_node_mapping[x])
 
-	 hwmon_path = os.listdir(hwmon_input_path_mapping[x])
-	 hwmon_dir = ''
-	 for hwmon_name in hwmon_path:
-	     hwmon_dir = hwmon_name
-	    
-	 pwm_input_path_mapping[x] = PWM1FREQ_PATH.format(
+         hwmon_path = os.listdir(hwmon_input_path_mapping[x])
+         hwmon_dir = ''
+         for hwmon_name in hwmon_path:
+             hwmon_dir = hwmon_name
+
+         pwm_input_path_mapping[x] = PWM1FREQ_PATH.format(
 		                                 hwmon_input_node_mapping[x],
 				                 hwmon_dir)
          device_path = pwm_input_path_mapping[x]
@@ -228,7 +228,7 @@ def main():
          cmd = "22500"
          write_file(cmd, device_path)
 
-	 numsensors_input_path_mapping[x] = NUMSENSORS_PATH.format(
+         numsensors_input_path_mapping[x] = NUMSENSORS_PATH.format(
 		                                 hwmon_input_node_mapping[x],
 				                 hwmon_dir)
          numsensors_path = numsensors_input_path_mapping[x]
