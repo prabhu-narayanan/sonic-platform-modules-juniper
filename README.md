@@ -1,5 +1,5 @@
 HPE/Juniper Networks Platform Support for SONiC
-===========================================
+==============================================
 
 This readme provides information on how to install and upgrade ONIE and SONiC images on the Juniper Networks switches. 
 
