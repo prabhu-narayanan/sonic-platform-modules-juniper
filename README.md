@@ -1,4 +1,6 @@
-# Juniper QFX5241 Platform Package
+
+HPE/Juniper Networks Platform Support for SONiC
+==============================================
 
 This repository packages the Juniper QFX5241 SONiC platform support and its shared Juniper platform components. The first phase targets QFX5241 only.
 
