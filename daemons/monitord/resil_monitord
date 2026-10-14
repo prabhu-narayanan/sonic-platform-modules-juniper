@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""
+Resiliency: FPGA/CPLD access monitor
+"""
+
+import os
+import sys
+import mmap
+import struct
+import time
+import signal
+import random
+
+from datetime import datetime
+from sonic_py_common import daemon_base
+from swsscommon import swsscommon
+
+sys.path.insert(0, '/usr/local/lib/python3.11/dist-packages')
+sys.path.insert(0, '/usr/lib/python3/dist-packages')
+
+# Configuration
+FPGA_BASE_ADDRESS  = 0x0
+CPLD1_BASE_ADDRESS = 0x2000
+CPLD2_BASE_ADDRESS = 0x3000
+MEM_SIZE           = 0x200       # 512 bytes per device
+POLL_INTERVAL      = 5           # Seconds between polls
+
+# Register offset
+SCRATCH_REG_OFFSET = 0x04
+
+# STATE_DB configuration
+STATE_DB_TABLE = "FPGA_MONITOR"
+
+# FPGA Reset configuration
+FPGA_RESET = (1 << 8)           # Bit 8 for reset
+FPGA_RESET_DELAY = 10000        # 10000 microseconds = 10ms
+
+class DeviceMonitor:
+    def __init__(self, name, base_addr, size):
+        self.name = name
+        self.base_addr = base_addr
+        self.size = size
+        self.fd = None
+        self.mem = None
+
+    def open(self):
+        """Open /dev/mem and map device memory"""
+        try:
+            self.fd = os.open('/dev/mem', os.O_RDWR | os.O_SYNC)
+            self.mem = mmap.mmap(
+                    self.fd,
+                    self.size,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                    offset=self.base_addr
+                    )
+            print(f"[{self.get_timestamp()}] Mapped {self.name} at 0x{self.base_addr:08X}")
+            return True
+        except Exception as e:
+            print(f"ERROR: Failed to open {self.name}: {e}")
+            return False
+
+    def close(self):
+        if self.mem:
+            self.mem.close()
+            self.mem = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def read_scratch_reg(self, offset):
+        if not self.mem:
+            return None
+        try:
+            data = self.mem[offset:offset+4]
+            value = struct.unpack('<I', data)[0]
+            return value
+        except Exception as e:
+            print(f"ERROR: Failed to read {self.name} scratch register: {e}")
+            return None
+
+    def write_scratch_reg(self, offset, value):
+        if not self.mem:
+            return False
+        try:
+            data = struct.pack('<I', value)
+            self.mem[offset:offset+4] = data
+            return True
+        except Exception as e:
+            print(f"ERROR: Failed to write {self.name} scratch register: {e}")
+            return False
+
+    def get_timestamp(self):
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+class RegisterMonitor(daemon_base.DaemonBase):
+    def __init__(self, log_identifier, devices):
+        super().__init__(log_identifier)
+        self.devices = devices
+        self.running = True
+        self.state_db = None
+
+    def stop(self):
+        self.running = False
+
+    def _stop_handler(self, signum, frame):
+        self.log_info(f"Received signal {signum}, stopping monitor...")
+        self.stop()
+        sys.exit(1)
+
+    def _update_state_db(self, device_name, status, message=""):
+        """Update STATE_DB with device status"""
+        if not self.state_db:
+            return
+
+        try:
+            # Prepare data
+            timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+            value = [
+                    ("timestamp", timestamp),
+                    ("status", status),
+                    ("message", message)
+                    ]
+
+            # Update using hmset (set multiple fields at once)
+            #self.state_table.set(device_name, value)
+            self.state_table.set(device_name, swsscommon.FieldValuePairs(value))
+            self.log_debug(f"Updated STATE_DB: {device_name} - status={value}")
+
+        except Exception as e:
+            self.log_error(f"Failed to update STATE_DB for {device_name}: {e}")
+
+    def run(self):
+        pll_reset = False
+        self.log_info("Scratch Register Monitor Started")
+        self.log_info(f"Poll Interval: {POLL_INTERVAL} seconds")
+        # Connect to STATE_DB
+        try:
+            self.state_db = daemon_base.db_connect("STATE_DB")
+            self.state_table = swsscommon.Table(self.state_db, STATE_DB_TABLE)
+            self.log_info("Connected to State DB successfully")
+        except Exception as e:
+            self.log_error(f"Failed to connect to State DB: {e}")
+            sys.exit(1)
+
+        # Open all device mappings
+        all_opened = True
+        for dev in self.devices:
+            if not dev.open():
+                all_opened = False
+                break
+
+        if not all_opened:
+            # Close any that were opened
+            for dev in self.devices:
+                if dev.mem:
+                    dev.close()
+                return
+        try:
+            while self.running:
+                for dev in self.devices:
+                    val = dev.read_scratch_reg(SCRATCH_REG_OFFSET)
+                    if val is None:
+                        self.log_error(f"{dev.name}: Failed to read register")
+                        self._update_state_db(dev.name, "fail", "Read failed")
+                        continue
+
+                    scratch_value = random.randint(0, 254)
+
+                    val = (val & ~0xFF) | scratch_value
+
+                    if not dev.write_scratch_reg(SCRATCH_REG_OFFSET, val):
+                        self.log_error(f"{dev.name}: Write failed")
+                        self._update_state_db(dev.name, "fail", "Write failed")
+                        continue
+
+                    # Sleep for 200 microseconds
+                    time.sleep(0.0002)
+
+                    val_read = dev.read_scratch_reg(SCRATCH_REG_OFFSET)
+                    if val_read is None:
+                        self.log_error(f"{dev.name}: Read-back failed")
+                        self._update_state_db(dev.name, "fail", "Read-back failed")
+                        continue
+                    val_read_byte = val_read & 0xFF
+
+                    # Validate
+                    if val_read_byte == scratch_value:
+                        status = "pass"
+                    else:
+                        status = "fail"
+                        self.log_warning(f"{dev.name}: Test failed (wrote 0x{scratch_value:02X}, read 0x{val_read_byte:02X})")
+
+                    # Update STATE_DB
+                    self._update_state_db(dev.name, status, f"wrote=0x{scratch_value:02X}, read=0x{val_read_byte:02X}")
+
+                    # Pll reset
+                    if pll_reset == False:
+                        self.log_info(f"{dev.name}:Cycle Reset Timing Board")
+                        pll_reset = True
+                        val_read = dev.read_scratch_reg(SCRATCH_REG_OFFSET)
+                        # Clear bit 8 (reset low)
+                        reset_val = val_read & ~FPGA_RESET
+                        dev.write_scratch_reg(SCRATCH_REG_OFFSET, reset_val)
+                        # Wait for reset delay (10ms)
+                        time.sleep(FPGA_RESET_DELAY / 1000000.0)  # Convert microseconds to seconds
+                        # Read again and set reset bit
+                        val_read = dev.read_scratch_reg(SCRATCH_REG_OFFSET)
+                        # Set bit 8 (reset high)
+                        reset_val = val_read | FPGA_RESET
+                        dev.write_scratch_reg(SCRATCH_REG_OFFSET, reset_val)
+ 
+                # Sleep for the poll interval
+                time.sleep(POLL_INTERVAL)
+        except Exception as e:
+            self.log_error(f"Monitoring failed: {e}")
+
+def main():
+    # Define devices
+    devices = [
+            DeviceMonitor("FPGA",  FPGA_BASE_ADDRESS,  MEM_SIZE),
+            DeviceMonitor("CPLD1", CPLD1_BASE_ADDRESS, MEM_SIZE),
+            DeviceMonitor("CPLD2", CPLD2_BASE_ADDRESS, MEM_SIZE)
+            ]
+    daemon = RegisterMonitor("resil_monitord", devices)
+    daemon.run()
+
+if __name__ == "__main__":
+    main()

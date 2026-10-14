@@ -1,0 +1,78 @@
+#!/bin/bash
+# Pre-removal script for sonic-platform-juniper-common
+# Cleanly removes dc-jma and jmd-dispatcher before package files are deleted.
+
+# ── Stop and remove dc-jma container ───────────────────────────────
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^dc-jma$"; then
+    docker stop dc-jma 2>/dev/null || true
+fi
+if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^dc-jma$"; then
+    docker rm dc-jma 2>/dev/null || true
+fi
+
+# ── Disable systemd services ──────────────────────────────────────
+# Mask first to prevent Restart=always from restarting the service
+# between our stop and dpkg removing the unit file.
+for svc in dc-jma.service jmd-dispatcher.service psuStatusd.service container-shutdown-watcher.service resil_monitord.service; do
+    systemctl mask "$svc" 2>/dev/null || true
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        systemctl stop "$svc" 2>/dev/null || true
+    fi
+done
+
+# ── Remove dc-jma from CONFIG_DB (Redis) ──────────────────────────
+if command -v redis-cli >/dev/null 2>&1; then
+    if redis-cli -n 4 PING 2>/dev/null | grep -q PONG; then
+        for key in "FEATURE|dc-jma" "AUTO_TECHSUPPORT_FEATURE|dc-jma" "SYSLOG_CONFIG_FEATURE|dc-jma"; do
+            redis-cli -n 4 DEL "$key" >/dev/null 2>&1 || true
+        done
+    fi
+fi
+
+# ── Remove dc-jma from config_db.json ─────────────────────────────
+CONFIG_DB_JSON="/etc/sonic/config_db.json"
+if [ -f "$CONFIG_DB_JSON" ] && command -v jq >/dev/null 2>&1; then
+    if jq -e '.FEATURE["dc-jma"]' "$CONFIG_DB_JSON" >/dev/null 2>&1; then
+        cp "$CONFIG_DB_JSON" "${CONFIG_DB_JSON}.bak-prerm"
+        jq 'del(.FEATURE["dc-jma"]) |
+            del(.AUTO_TECHSUPPORT_FEATURE["dc-jma"]) |
+            del(.SYSLOG_CONFIG_FEATURE["dc-jma"])' \
+            "${CONFIG_DB_JSON}.bak-prerm" > "${CONFIG_DB_JSON}.new" 2>/dev/null
+        if [ -s "${CONFIG_DB_JSON}.new" ] && jq empty "${CONFIG_DB_JSON}.new" 2>/dev/null; then
+            mv "${CONFIG_DB_JSON}.new" "$CONFIG_DB_JSON"
+        else
+            rm -f "${CONFIG_DB_JSON}.new"
+        fi
+    fi
+fi
+
+# ── Remove dc-jma from init_cfg.json ──────────────────────────────
+INIT_CFG="/etc/sonic/init_cfg.json"
+if [ -f "$INIT_CFG" ] && command -v jq >/dev/null 2>&1; then
+    if jq -e '.FEATURE["dc-jma"]' "$INIT_CFG" >/dev/null 2>&1; then
+        cp "$INIT_CFG" "${INIT_CFG}.bak-prerm"
+        jq 'del(.FEATURE["dc-jma"]) |
+            del(.AUTO_TECHSUPPORT_FEATURE["dc-jma"]) |
+            del(.SYSLOG_CONFIG_FEATURE["dc-jma"])' \
+            "${INIT_CFG}.bak-prerm" > "${INIT_CFG}.new" 2>/dev/null
+        if [ -s "${INIT_CFG}.new" ] && jq empty "${INIT_CFG}.new" 2>/dev/null; then
+            mv "${INIT_CFG}.new" "$INIT_CFG"
+        else
+            rm -f "${INIT_CFG}.new"
+        fi
+    fi
+fi
+
+# ── Remove Docker image ───────────────────────────────────────────
+if docker images --format '{{.Repository}}' 2>/dev/null | grep -q "docker-sonic-dc-jma"; then
+    docker rmi docker-sonic-dc-jma 2>/dev/null || true
+fi
+
+# Unmask and reload so a fresh install is not blocked by stale masks
+for svc in dc-jma.service jmd-dispatcher.service psuStatusd.service container-shutdown-watcher.service resil_monitord.service; do
+    systemctl unmask "$svc" 2>/dev/null || true
+done
+systemctl daemon-reload 2>/dev/null || true
+
+echo "dc-jma cleanup complete"
+exit 0

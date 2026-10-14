@@ -5,10 +5,16 @@ Maintainer: Juniper Networks <crajank@juniper.net>
 Build-Depends: debhelper (>= 9), bzip2
 Standards-Version: 3.9.3
 
-Package: sonic-platform-juniper-qfx5210
+Package: sonic-platform-juniper-common
 Architecture: amd64
-Description: kernel modules for platform devices such as fan, led, sfp
+Description: shared Juniper Broadcom platform Python, daemons, and services
+ Shared sonic_platform Python packages, common Juniper utilities, dc-jma,
+ jmd-dispatcher, and shared service wiring for QFX5241.
 
-Package: sonic-platform-juniper-qfx5200
+Package: sonic-platform-juniper-qfx5241
 Architecture: amd64
-Description: kernel modules for platform devices such as fan, led, sfp
+Depends: sonic-platform-juniper-common
+Replaces: sonic-device-data
+Description: Juniper QFX5241 platform-specific kernel modules and init service
+
+

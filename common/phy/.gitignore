@@ -1,0 +1,11 @@
+# BFT places the PAI-SDK tarballs here at checkout; the Makefile extracts them
+# at build time. Tarballs and extracted vendor dirs are not tracked (patches/ is).
+*.tgz
+*.tar
+/epdm/
+/pai/
+/agera/
+/barchetta/BARC_*/
+/blackfin/
+/output/
+/.prepared

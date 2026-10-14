@@ -1,0 +1,62 @@
+module sonic-dc-jma {
+
+    yang-version 1.1;
+
+    namespace "https://ssd-git.juniper.net/aide-jcloud/sonic/jma";
+    prefix dc-jma;
+
+    import ietf-inet-types {
+        prefix inet;
+    }
+
+    description
+        "YANG model for dc-jma (Juniper Mist Agent) configuration
+         in the SONiC CONFIG_DB.";
+
+    revision 2026-04-20 {
+        description "Initial revision — DC_JMA config table.";
+    }
+
+    container sonic-dc-jma {
+
+        container DC_JMA {
+
+            description
+                "Juniper Mist Agent (dc-jma) configuration table.
+                 Maps to CONFIG_DB|DC_JMA|config.";
+
+            container config {
+
+                description "dc-jma global configuration entry.";
+
+                leaf epterm_ip {
+                    type inet:ipv4-address;
+                    description
+                        "IPv4 address of the EPterm (Mist cloud proxy)
+                         endpoint. Written to /etc/hosts inside the
+                         dc-jma container by ensure_epterm.sh at
+                         container start time.";
+                }
+
+                leaf sonic_mode {
+                    type string {
+                        pattern "true|false";
+                    }
+                    default "true";
+                    description
+                        "When 'true', dc-jma runs in native SONiC container
+                         mode (supervisord as PID 1, JMA_SONIC_MODE=1).";
+                }
+
+                leaf log_level {
+                    type string {
+                        pattern "debug|info|warning|error";
+                    }
+                    default "info";
+                    description
+                        "Log verbosity level for mcd and jmd processes.";
+                }
+            }
+        }
+    }
+}

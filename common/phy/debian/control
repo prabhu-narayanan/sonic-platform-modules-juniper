@@ -1,0 +1,13 @@
+Source: libsaigearbox
+Section: libs
+Priority: optional
+Maintainer: Juniper Networks <sonic@juniper.net>
+Build-Depends: debhelper (>= 9)
+Standards-Version: 3.9.6
+
+Package: libsaigearbox
+Architecture: amd64
+Description: Broadcom gearbox/PHY SAI library (EPDM + PAI + Agera + Barchetta)
+ Shared library implementing SAI for Broadcom retimer/gearbox PHYs. Carries all
+ PHY families (Agera AGR3 and Barchetta BARC) in one library, shared by both
+ gbsyncd dockers.

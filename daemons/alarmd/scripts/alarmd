@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+alarmd -- SONiC Alarm Monitoring Daemon (entry point).
+
+Subclasses DaemonBase from sonic_py_common, following the same pattern
+as psud, thermalctld, and system-health/healthd:
+  - Loads alarm definitions via config.load_alarm_defs()
+  - Connects to STATE_DB via daemon_base.db_connect()
+  - Instantiates AlarmStore, StateDBPoller, ScriptRunner
+  - Runs the main poll loop
+  - Handles SIGHUP (reload) and SIGTERM (shutdown)
+
+Helper modules (alarm_store, statedb_poller, script_runner) each have
+their own module-level SysLogger instances — the daemon does NOT pass
+itself as a logger to them.
+"""
+
+import os
+import sys
+import fcntl
+import time
+import signal
+import threading
+
+from sonic_py_common import daemon_base
+from swsscommon.swsscommon import Table
+
+from sonic_alarm.constants import (
+    SYSTEM_ALARMS_TABLE,
+    DEFAULT_STATEDB_INTERVAL,
+    DEFAULT_SCRIPT_INTERVAL,
+    MIN_STATEDB_INTERVAL,
+    MIN_SCRIPT_INTERVAL,
+    MAX_STATEDB_CHECKS,
+    MAX_SCRIPT_CHECKS,
+    MAX_SCRIPT_TIMEOUT,
+    SCRIPT_TIMEOUT,
+    PIDFILE_PATH,
+    SYSLOG_IDENTIFIER,
+)
+from sonic_alarm import config
+from sonic_alarm.alarm_store import AlarmStore
+from sonic_alarm.statedb_poller import StateDBPoller
+from sonic_alarm.script_runner import ScriptRunner
+
+
+# ---------------------------------------------------------------------------
+# Single-instance enforcement via PID file lock
+# ---------------------------------------------------------------------------
+
+def acquire_pidfile_lock():
+    """Acquire an exclusive lock on the PID file.
+
+    Returns the open file handle (must be kept alive for the lock to persist).
+    Raises SystemExit if another instance already holds the lock.
+    """
+    fh = open(PIDFILE_PATH, 'w')
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        fh.close()
+        raise SystemExit(
+            f"alarmd is already running (lock held on {PIDFILE_PATH})")
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+class AlarmDaemon(daemon_base.DaemonBase):
+    """Main alarm daemon.
+
+    Extends DaemonBase for SONiC-standard logging and signal handling.
+
+    Runs two loops in daemon threads:
+      - StateDB poller (fast, default every 3s)
+      - Script runner  (slow, default every 60s)
+
+    Supports SIGHUP for live config reload without restart.
+    """
+
+    def __init__(self):
+        super().__init__(SYSLOG_IDENTIFIER)
+        self.set_min_log_priority_info()
+
+        self._running = True
+        self._reload_requested = False
+
+        # Load alarm definitions
+        self._defs = config.load_alarm_defs()
+        if self._defs is None:
+            raise SystemExit(1)
+
+        # Connect to STATE_DB using SONiC standard helper
+        self._state_db = daemon_base.db_connect("STATE_DB")
+        self._alarms_table = Table(self._state_db, SYSTEM_ALARMS_TABLE)
+
+        # Alarm store -- the ONLY writer to SYSTEM_ALARMS
+        # No logger param — AlarmStore has its own module-level SysLogger
+        self._store = AlarmStore(self._defs, self._alarms_table)
+        self._store.clear_on_startup()
+
+        # Parse intervals
+        settings = self._defs.get('alarmd_settings', {})
+        self._statedb_interval = max(
+            settings.get('statedb_poll_interval', DEFAULT_STATEDB_INTERVAL),
+            MIN_STATEDB_INTERVAL)
+        self._script_interval = max(
+            settings.get('script_poll_interval', DEFAULT_SCRIPT_INTERVAL),
+            MIN_SCRIPT_INTERVAL)
+
+        # Split alarm_tables by type and enforce hard limits
+        statedb_tables, script_groups = self._split_and_limit(
+            self._defs.get('alarm_tables', []))
+
+        # No logger param — helpers have their own module-level SysLoggers
+        self._statedb_poller = StateDBPoller(
+            statedb_tables, self._store, self._state_db)
+        self._script_runner = ScriptRunner(
+            script_groups, self._store)
+
+        statedb_count = sum(
+            len(t.get('checks', [])) for t in statedb_tables)
+        script_count = sum(
+            len(t.get('checks', [])) for t in script_groups)
+        self.log_info(
+            f"alarmd initialized: {statedb_count} statedb checks "
+            f"(every {self._statedb_interval}s), "
+            f"{script_count} script checks "
+            f"(every {self._script_interval}s)")
+
+    def _split_and_limit(self, alarm_tables):
+        """Split alarm_tables by type and enforce hard limits."""
+        statedb_tables = []
+        script_groups = []
+        for table in alarm_tables:
+            if table.get('type', 'statedb') == 'script':
+                script_groups.append(table)
+            else:
+                statedb_tables.append(table)
+
+        statedb_count = sum(
+            len(t.get('checks', [])) for t in statedb_tables)
+        script_count = sum(
+            len(t.get('checks', [])) for t in script_groups)
+
+        if statedb_count > MAX_STATEDB_CHECKS:
+            self.log_warning(
+                f"statedb checks ({statedb_count}) exceed hard limit "
+                f"({MAX_STATEDB_CHECKS}) — truncating")
+            statedb_tables = _truncate_checks(
+                statedb_tables, MAX_STATEDB_CHECKS)
+
+        if script_count > MAX_SCRIPT_CHECKS:
+            self.log_warning(
+                f"script checks ({script_count}) exceed hard limit "
+                f"({MAX_SCRIPT_CHECKS}) — truncating")
+            script_groups = _truncate_checks(
+                script_groups, MAX_SCRIPT_CHECKS)
+
+        # Clamp per-script timeouts
+        for group in script_groups:
+            for check in group.get('checks', []):
+                t = check.get('timeout', SCRIPT_TIMEOUT)
+                check['timeout'] = min(t, MAX_SCRIPT_TIMEOUT)
+
+        return statedb_tables, script_groups
+
+    # Override signal handler from DaemonBase
+    def signal_handler(self, sig, frame):
+        if sig == signal.SIGHUP:
+            self._reload_requested = True
+        elif sig in (signal.SIGTERM, signal.SIGINT):
+            self.log_info(f"Caught signal {sig} — stopping...")
+            self._running = False
+        else:
+            self.log_warning(f"Caught unhandled signal {sig}")
+
+    def _reload(self):
+        """Hot-reload alarm definitions from disk."""
+        self.log_info("SIGHUP received — reloading alarm definitions")
+
+        new_defs = config.load_alarm_defs()
+        if new_defs is None:
+            self.log_error(
+                "Reload FAILED — keeping existing config. "
+                "Fix the alarm definitions and send SIGHUP again.")
+            return
+
+        settings = new_defs.get('alarmd_settings', {})
+        self._statedb_interval = max(
+            settings.get('statedb_poll_interval', DEFAULT_STATEDB_INTERVAL),
+            MIN_STATEDB_INTERVAL)
+        self._script_interval = max(
+            settings.get('script_poll_interval', DEFAULT_SCRIPT_INTERVAL),
+            MIN_SCRIPT_INTERVAL)
+
+        statedb_tables, script_groups = self._split_and_limit(
+            new_defs.get('alarm_tables', []))
+
+        self._statedb_poller = StateDBPoller(
+            statedb_tables, self._store, self._state_db)
+        self._script_runner = ScriptRunner(
+            script_groups, self._store)
+
+        # Refresh AlarmStore metadata for new alarm_ids
+        self._store._rebuild_meta(new_defs)
+
+        # Purge alarms whose alarm_id no longer exists
+        valid_ids = self._store.known_alarm_ids()
+        purged = self._store.purge_stale_alarms(valid_ids)
+
+        self._defs = new_defs
+
+        statedb_count = sum(
+            len(t.get('checks', [])) for t in statedb_tables)
+        script_count = sum(
+            len(t.get('checks', [])) for t in script_groups)
+        self.log_info(
+            f"Reload complete: {statedb_count} statedb checks, "
+            f"{script_count} script checks, "
+            f"{len(purged)} stale alarms purged")
+
+    def _statedb_loop(self):
+        """StateDB polling loop -- runs in its own thread."""
+        self.log_info(
+            f"StateDB poller started (interval={self._statedb_interval}s)")
+        while self._running:
+            try:
+                self._statedb_poller.poll()
+            except Exception as exc:
+                self.log_error(f"StateDB poll error: {exc}")
+            time.sleep(self._statedb_interval)
+
+    def _script_loop(self):
+        """Script runner loop -- runs in its own thread."""
+        self.log_info(
+            f"Script runner started (interval={self._script_interval}s)")
+        time.sleep(10)  # delay on startup so statedb alarms settle first
+        while self._running:
+            try:
+                self._script_runner.run_all()
+            except Exception as exc:
+                self.log_error(f"Script runner error: {exc}")
+            time.sleep(self._script_interval)
+
+    def run(self):
+        """Start both loops and wait for shutdown signal."""
+        self.log_info("alarmd starting")
+
+        statedb_thread = threading.Thread(
+            target=self._statedb_loop, name='statedb-poller', daemon=True)
+        statedb_thread.start()
+
+        script_thread = threading.Thread(
+            target=self._script_loop, name='script-runner', daemon=True)
+        script_thread.start()
+
+        while self._running:
+            if self._reload_requested:
+                self._reload_requested = False
+                self._reload()
+            time.sleep(1)
+
+        self.log_info("alarmd shutting down")
+        self.log_info("alarmd stopped")
+
+
+def _truncate_checks(table_list, max_checks):
+    """Truncate a list of table/group defs so total checks <= max_checks."""
+    remaining = max_checks
+    result = []
+    for table in table_list:
+        checks = table.get('checks', [])
+        if remaining <= 0:
+            break
+        if len(checks) <= remaining:
+            result.append(table)
+            remaining -= len(checks)
+        else:
+            truncated = dict(table)
+            truncated['checks'] = checks[:remaining]
+            result.append(truncated)
+            remaining = 0
+    return result
+
+
+def main():
+    pidfile_fh = acquire_pidfile_lock()
+    try:
+        daemon = AlarmDaemon()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        import logging
+        logging.getLogger(SYSLOG_IDENTIFIER).error(
+            f"alarmd failed to start: {exc}")
+        return 1
+    daemon.run()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

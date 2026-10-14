@@ -1,10 +1,12 @@
 /*
- * Juniper Networks TMC I2C Accelerator driver
+ * Juniper TMC I2C Accelerator driver
  *
- * Copyright (C) 2020 Juniper Networks
+ * drivers/i2c/busses/i2c-tmc.c
+ *
+ * This driver is being adpoted from supercon FPGA driver.
+ *
+ * Copyright (C) 2018 Juniper Networks
  * Author: Ashish Bhensdadia <bashish@juniper.net>
- *
- * This driver implement the I2C functionality
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,7 +28,6 @@
 #include <linux/interrupt.h>
 #include <linux/of_gpio.h>
 #include <linux/platform_device.h>
-#include <linux/mfd/core.h>
 #include "jnx-tmc.h"
 
 
@@ -56,8 +57,10 @@
 #define tmc_iowrite(val, addr)		iowrite32((val), (addr))
 
 #define TMC_I2C_CTRL_GROUP(g)		(((g) & 0xFF) << 8)
-#define TMC_I2C_CTRL_WRCNT(w)		(((w) & 0x3F) << 16)
-#define TMC_I2C_CTRL_RDCNT(r)		(((r) & 0x3F) << 16)
+#define TMC_I2C_CTRL_WRCNT_LSB(w)	(((w) & 0x3F) << 16)
+#define TMC_I2C_CTRL_WRCNT_MSB(w)       (((w) & 0x1C0) << 22)
+#define TMC_I2C_CTRL_RDCNT_LSB(r)	(((r) & 0x3F) << 16)
+#define TMC_I2C_CTRL_RDCNT_MSB(r)       (((r) & 0x1C0) << 22)
 #define TMC_I2C_CTRL_DEVADDR(d)		(((d) & 0xFF) << 8)
 #define TMC_I2C_CTRL_OFFSET(o)		((o) & 0xFF)
 
@@ -65,14 +68,22 @@
 #define TMC_I2C_MEM_CTRL_VLD		BIT(31)
 
 #define TMC_I2C_CTRL_ERR(s)		((s) & 0x0F000000)
+#define TMC_I2C_NACK(s)                 ((s) & 0x01000000)
 #define TMC_I2C_CTRL_DONE_BIT(s)	((s) & BIT(31))
-#define TMC_I2C_CTRL_STATUS_OK(s)	(TMC_I2C_CTRL_DONE_BIT(s) & \
+#define TMC_I2C_CTRL_STATUS(s)		(TMC_I2C_CTRL_DONE_BIT(s) | \
 					TMC_I2C_CTRL_ERR(s))
 #define TMC_I2C_CTRL_DONE(s)		(TMC_I2C_CTRL_DONE_BIT(s) == BIT(31))
 
 #define TMC_I2C_STAT_INC(adap, s)	(((adap)->stat.s)++)
 #define TMC_I2C_STAT_INCN(adap, s, n)	(((adap)->stat.s) += (n))
 #define TMC_I2C_GET_MASTER(tadap)	((tadap)->tctrl)
+
+/*
+ * HW supports 511 entries per spec
+ * There are 4 entries used for control transactions.
+ * Thus, set the max block to 507
+ */
+#define TMC_I2C_BLOCK_MAX        507
 
 #define TMC_I2C_READ   0x1
 #define TMC_I2C_WRITE  0x2
@@ -93,19 +104,8 @@ do { \
 		dev_err(dev, fmt, ## args); \
 } while (0)
 
-
-/* pfe TMC i2c channel */
-static int pfe_channel = 32;
-module_param(pfe_channel, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-MODULE_PARM_DESC(pfe_channel, "Maximum number of channel for PFE TMC");
-
-/* chassid TMC i2c channel */
-static int chd_channel = 11;
-module_param(chd_channel, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-MODULE_PARM_DESC(chd_channel, "Maximum number of channel for CHASSID TMC");
-
-static u32 wr_index_to_oper[] = {0x01000000, 0x02000000,
-				0x84000000, 0x85000000, 0x83000000};
+static u32 wr_index_to_oper[] = {0x00000000, 0x01000000, 0x02000000,
+				0x84000000, 0x85000000};
 static u32 rd_index_to_oper[] = {0x08000000, 0x09000000, 0x0A000000,
 				0x8B000000, 0x8C000000, 0x8D000000, 0x83000000};
 
@@ -225,7 +225,7 @@ static int tmc_i2c_mstr_wait_rdy(struct i2c_adapter *adap, u8 rw, u32 delay)
 			return 0;
 
 		if (tadap->polling) {
-			usleep_range(50, 100);
+			usleep_range(500, 600);
 		} else {
 			tadap->done = false;
 			wait_event_timeout(tadap->wait, tadap->done,
@@ -252,7 +252,7 @@ static u32 tmc_i2c_mstr_wait_completion(struct i2c_adapter *adap,
 		unsigned long timeout = jiffies + adap->timeout;
 
 		do {
-			usleep_range(1000, 1200);
+			usleep_range(500, 600);
 			val = ioread32(TMC_I2C_MSTR_I2C_DPMEM(tadap,
 					dp_entry_offset));
 			if (TMC_I2C_CTRL_DONE(val))
@@ -264,14 +264,50 @@ static u32 tmc_i2c_mstr_wait_completion(struct i2c_adapter *adap,
 					dp_entry_offset));
 	}
 
-	return TMC_I2C_CTRL_STATUS_OK(val);
+	if (!TMC_I2C_CTRL_DONE(val) || TMC_I2C_CTRL_ERR(val))
+		return ((!TMC_I2C_CTRL_DONE_BIT(val)) | TMC_I2C_CTRL_STATUS(val));
+
+	return 0;
+}
+
+/*
+ * Wait for master completion and return read data
+ */
+static u32 tmc_i2c_mstr_wait_completion_read(struct i2c_adapter *adap,
+					u32 dp_entry_offset, u32 *data)
+{
+	struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
+	u32 val;
+
+	if (tadap->polling) {
+		unsigned long timeout = jiffies + adap->timeout;
+
+		do {
+			usleep_range(500, 600);
+			val = ioread32(TMC_I2C_MSTR_I2C_DPMEM(tadap,
+					dp_entry_offset));
+			if (TMC_I2C_CTRL_DONE(val))
+				break;
+		} while (time_before(jiffies, timeout));
+	} else {
+		wait_event_timeout(tadap->wait, tadap->done, adap->timeout);
+		val = ioread32(TMC_I2C_MSTR_I2C_DPMEM(tadap,
+					dp_entry_offset));
+	}
+	*data = val;
+
+	if (!TMC_I2C_CTRL_DONE(val) || TMC_I2C_CTRL_ERR(val))
+		return TMC_I2C_CTRL_STATUS(val);
+
+	return 0;
 }
 
 /*
  * TMC I2C delay read/write operation
  */
 static int tmc_i2c_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
-			u32 addr, u32 offset, u32 len, u32 delay, u8 *buf)
+			u32 addr, u32 offset, bool useoffset, u32 len,
+			u32 delay, u8 *buf)
 {
 	struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
 	struct device *dev = &adap->dev;
@@ -310,15 +346,16 @@ static int tmc_i2c_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
 
 	/* prepare control command */
 	control |= TMC_I2C_CTRL_DEVADDR(addr);
-	control |= TMC_I2C_CTRL_OFFSET(offset);
+	if (useoffset || rw == TMC_I2C_WRITE)
+		control |= TMC_I2C_CTRL_OFFSET(offset);
 
 	if (rw == TMC_I2C_WRITE) {
 		for (n = 0; n < len; n++)
 			data |= (buf[n] << ((len - 1 - n) * 8));
 		tmc_iowrite(data, TMC_I2C_MSTR_I2C_DPMEM(tadap,
 				TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10));
-		control |= TMC_I2C_CTRL_WRCNT(len);
-		control |= wr_index_to_oper[len-1];
+		control |= TMC_I2C_CTRL_WRCNT_LSB(len);
+		control |= wr_index_to_oper[len];
 		dev_dbg(dev, "WR Data: [%#04x, %#04x, %#04x, %#04x]\n",
 			((data >> 24) & 0xff), ((data >> 16) & 0xff),
 			((data >> 8) & 0xff), (data & 0xff));
@@ -327,8 +364,11 @@ static int tmc_i2c_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
 		/* read */
 		tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
 				TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10));
-		control |= TMC_I2C_CTRL_RDCNT(len);
-		control |= rd_index_to_oper[len-1];
+		control |= TMC_I2C_CTRL_RDCNT_LSB(len);
+		if (useoffset)
+			control |= rd_index_to_oper[len - 1];
+		else
+			control |= rd_index_to_oper[len + 1];
 	}
 
 	/*
@@ -372,9 +412,16 @@ static int tmc_i2c_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
 	val = tmc_i2c_mstr_wait_completion(adap,
 			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10);
 	if (val) {
-		dev_err(&adap->dev,
-			"i2c transaction error (0x%08x)\n", val);
-
+		if (TMC_I2C_NACK(val))
+			dev_warn(&adap->dev,
+			"i2c delay transaction error (0x%08x)\n"
+			"Channel 0x%08x, addr 0x%08x\n",
+			val, mux, addr);
+		else
+			dev_err(&adap->dev,
+			"i2c delay transaction error (0x%08x)\n"
+			"Channel 0x%08x, addr 0x%08x\n",
+			val, mux, addr);
 		/* stop the transaction */
 		tmc_iowrite(0x00000000, TMC_I2C_MSTR_AUTOMATION_I2C(tadap,
 				TMC_I2C_MSTR_AUTOMATION_I2C_SCAN_OFFSET));
@@ -412,7 +459,8 @@ static int tmc_i2c_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
  *TMC I2C none delay Read/write opertion
  */
 static int tmc_i2c_none_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
-					u32 addr, u32 offset, u32 len, u8 *buf)
+					u32 addr, u32 offset, bool useoffset,
+					u32 len, u8 *buf)
 {
 	struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
 	struct device *dev = &adap->dev;
@@ -440,14 +488,15 @@ static int tmc_i2c_none_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
 
 	/* prepare control command */
 	control |= TMC_I2C_CTRL_DEVADDR(addr);
-	control |= TMC_I2C_CTRL_OFFSET(offset);
+	if (useoffset || rw == TMC_I2C_WRITE)
+		control |= TMC_I2C_CTRL_OFFSET(offset);
 
 	if (rw == TMC_I2C_WRITE) {
 		for (n = 0; n < len; n++)
 			data |= (buf[n] << (n * 8));
 		tmc_iowrite(data, TMC_I2C_MSTR_I2C_DPMEM(tadap,
 				TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8));
-		control |= wr_index_to_oper[len-1];
+		control |= wr_index_to_oper[len];
 		dev_dbg(dev, "WR Data: [%#04x, %#04x, %#04x, %#04x]\n",
 			((data >> 24) & 0xff), ((data >> 16) & 0xff),
 			((data >> 8) & 0xff), (data & 0xff));
@@ -456,7 +505,10 @@ static int tmc_i2c_none_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
 		/* read */
 		tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
 				TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8));
-		control |= rd_index_to_oper[len-1];
+		if (useoffset)
+			control |= rd_index_to_oper[len - 1];
+		else
+			control |= rd_index_to_oper[len + 1];
 	}
 
 	/*
@@ -501,9 +553,16 @@ static int tmc_i2c_none_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
 	val = tmc_i2c_mstr_wait_completion(adap,
 			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8);
 	if (val) {
-		dev_err(&adap->dev,
-			"i2c transaction error (0x%08x)\n", val);
-
+		if (TMC_I2C_NACK(val))
+			dev_warn(&adap->dev,
+			"i2c transaction error (0x%08x)\n"
+			"Channel 0x%08x, addr 0x%08x\n",
+			val, mux, addr);
+		else
+			dev_err(&adap->dev,
+			"i2c transaction error (0x%08x)\n"
+			"Channel 0x%08x, addr 0x%08x\n",
+			val, mux, addr);
 		/* stop the transaction */
 		tmc_iowrite(0x00000000, TMC_I2C_MSTR_AUTOMATION_I2C(tadap,
 				TMC_I2C_MSTR_AUTOMATION_I2C_SCAN_OFFSET));
@@ -539,86 +598,218 @@ static int tmc_i2c_none_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
  * TMC I2C read/write operation
  */
 static int tmc_i2c_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
-			 u32 addr, u32 offset, u32 len, u8 *buf)
+			 u32 addr, u32 offset, bool useoffset, u32 len, u8 *buf)
 {
 	struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
 	u32 i2c_delay = tadap->i2c_delay;
 
 	if (i2c_delay) {
 		return tmc_i2c_delay_rw_op(adap, rw, mux, addr, offset,
-						len, i2c_delay, buf);
+					useoffset, len, i2c_delay, buf);
 	} else {
 		return tmc_i2c_none_delay_rw_op(adap, rw, mux, addr, offset,
-						len, buf);
+					useoffset, len, buf);
 	}
 }
 
+#if 0
 static int tmc_i2c_calc_entries(int msglen)
 {
 	int entries = msglen / TMC_I2C_TRANS_LEN;
 
 	return (entries += (msglen % TMC_I2C_TRANS_LEN) ? 1 : 0);
 }
+#endif
 
-static int tmc_i2c_block_read(struct i2c_adapter *adap,
-				   struct i2c_msg *msgs, int num)
+/*
+*TMC I2C R/W opertion
+*tmc_i2c_block_rw_op API is used to perform I2C read/write Txn
+*just after selecting MUX channel.
+*/
+static int tmc_i2c_block_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
+        u32 addr, u32 offset, bool useoffset,
+        u32 len, u8 *buf)
 {
-	struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
-	struct device *dev = &adap->dev;
-	int curmsg, entries, len;
-	int offset = 0;
-	struct i2c_msg *msg;
-	int err, n = 0;
-	u8 rwbuf[4] = {0};
+    struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
+    int err, i = 0;
+    u32 control = 0, data = 0;
+    u32 start_add;
 
-	dev_dbg(dev, "Read i2c Block\n");
+    err = tmc_i2c_mstr_wait_rdy(adap, rw, 0);
+    if (err < 0) {
+        tmc_i2c_reset_master(adap);
+        return err;
+    }
 
-	for (curmsg = 0, offset = 0; curmsg < num; curmsg++) {
-		msg = &msgs[curmsg];
-		len = msg->len;
+    TMC_I2C_STAT_INC(tadap, mstr_rdy);
 
-		if (msg->flags & I2C_M_RECV_LEN)
-			len = (I2C_SMBUS_BLOCK_MAX + 1);
+    /* initialize the start address and mux */
+    tmc_iowrite(0x00000000, TMC_I2C_MSTR_AUTOMATION_I2C(tadap,
+                TMC_I2C_MSTR_AUTOMATION_I2C_DPMEM_OFFSET));
+    tmc_iowrite(mux, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_0));
+    tmc_iowrite(0x84400000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_4));
 
-		entries = tmc_i2c_calc_entries(len);
+    /* prepare control command */
+    control |= TMC_I2C_CTRL_DEVADDR(addr);
+    if (useoffset || rw == TMC_I2C_WRITE)
+        control |= TMC_I2C_CTRL_OFFSET(offset);
 
-		if (msg->flags & I2C_M_RD) {
-			if (curmsg == 1 && ((msg->flags & I2C_M_RECV_LEN &&
-				!(msgs[0].flags & I2C_M_RD)) ||
-				(msg->len > TMC_I2C_TRANS_LEN))) {
-				offset = msgs[0].buf[0];
-			}
+    if (rw == TMC_I2C_READ) {
+        /* read */
+        tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8));
+        control |= TMC_I2C_CTRL_RDCNT_LSB(len);
+        if (len >= 64)
+            control |= TMC_I2C_CTRL_RDCNT_MSB(len);
+        if (useoffset)
+            control |= rd_index_to_oper[6];
+        else
+            control |= rd_index_to_oper[5];
 
-			while (entries) {
-				err = tmc_i2c_rw_op(adap, TMC_I2C_READ,
-					tadap->mux_select,
-					msgs[0].addr, offset,
-					TMC_I2C_TRANS_LEN, rwbuf);
-				if (err < 0)
-					return err;
-				msg = &msgs[num - 1];
-				msg->buf[n] = rwbuf[0];
-				msg->buf[n+1] = rwbuf[1];
-				n = n + TMC_I2C_TRANS_LEN;
-				offset = offset + TMC_I2C_TRANS_LEN;
-				entries--;
-			}
-		}
-	}
+        tadap->control = control;
 
-	return 0;
+        /* operation control command */
+        tmc_iowrite(control, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_C));
+
+        /* End commands */
+        tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10));
+        tmc_iowrite(0x8E000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_14));
+        tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_18));
+        tmc_iowrite(0x8F000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_1C));
+
+    } else {
+        data = buf[1] << 8 | buf[0];
+        tmc_iowrite(data, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8));
+        control |= TMC_I2C_CTRL_WRCNT_LSB(len);
+        if (len >= 64)
+            control |= TMC_I2C_CTRL_WRCNT_MSB(len);
+
+        control |= wr_index_to_oper[4];
+
+        tadap->control = control;
+        /* Operation control command */
+        tmc_iowrite(control, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_C));
+
+        /* Write Data */
+        for (i = 1; i < (len + 1)/2; i++) {
+            if (i * 2 == len + 1)
+                data = buf[i * 2];
+            else
+                data = (buf[i * 2 + 1] << 8) | buf[i * 2];
+            tmc_iowrite(data, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                        TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8 + i * 8));
+            tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                        TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_C + i * 8));
+            /*
+            * I2C scan logic works at lower freq compared with
+            * PCIe logic. Require approx 1.3 us for continuous
+            * write.
+            */
+            udelay(2);
+        }
+        /* End commands */
+        tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8 + i * 8));
+        tmc_iowrite(0x8E000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_C + i++ * 8));
+        tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8 + i * 8));
+        tmc_iowrite(0x8F000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_C + i * 8));
+    }
+
+    tadap->done = false;
+    /* fire the transaction */
+    tmc_iowrite(0x00000001, TMC_I2C_MSTR_AUTOMATION_I2C(tadap,
+                TMC_I2C_MSTR_AUTOMATION_I2C_SCAN_OFFSET));
+
+    TMC_I2C_STAT_INC(tadap, go);
+
+    i = 0;
+    if (rw == TMC_I2C_READ) {
+        /* read a block of data */
+        start_add = TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8;
+        while (i < len) {
+            err = tmc_i2c_mstr_wait_completion_read(adap,
+                    start_add, &data);
+            if (err) {
+                if (TMC_I2C_NACK(err))
+                    dev_warn(&adap->dev,
+                           "i2c read transaction error (0x%08x)\n"
+                            "Channel: 0x%08x, device: 0x%08x, byte: %d\n",
+                             err, mux, addr, len);
+                else
+                    dev_err(&adap->dev,
+                            "i2c read transaction error (0x%08x)\n"
+                            "Channel: 0x%08x, device: 0x%08x, byte: %d\n",
+                            err, mux, addr, len);
+                err = -EIO;
+                break;
+            }
+            buf[i] = data & 0xff;
+            if (i + 1 < len)
+                buf[i + 1] = (data >> 8) & 0xff;
+            start_add = start_add + 8;
+            i = i + 2;
+
+            TMC_I2C_STAT_INC(tadap, rd_cnt);
+        }
+    } else {
+        start_add = TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8;
+        while (i < len) {
+            err = tmc_i2c_mstr_wait_completion(adap, start_add);
+            if (err) {
+                if (TMC_I2C_NACK(err)) {
+                    dev_warn(&adap->dev,
+                           "i2c write transaction error (0x%08x)\n"
+                           "Channel: 0x%08x, device: 0x%08x, byte: %d\n",
+                           err, mux, addr, len);
+                } else {
+                    dev_err(&adap->dev,
+                            "i2c write transaction error (0x%08x)\n"
+                            "Channel: 0x%08x, device: 0x%08x, byte: %d\n",
+                            err, mux, addr, len);
+                }
+                err = -EIO;
+                break;
+            }
+            start_add = start_add + 8;
+            i += 2;
+            TMC_I2C_STAT_INC(tadap, wr_cnt);
+     }
+    }
+
+    /* stop the transaction */
+    tmc_iowrite(0x00000000, TMC_I2C_MSTR_AUTOMATION_I2C(tadap,
+                TMC_I2C_MSTR_AUTOMATION_I2C_SCAN_OFFSET));
+
+    return err;
 }
 
 /*
- *TMC I2C SMB Read opertion
+ *TMC I2C R/W opertion
+ *tmc_i2c_delay_block_rw_op API used for RW operations where delay to
+ *select MUX in  CPLD is required. This API start I2C txn
+ *after delay once MUX in CPLD is selected
  */
-static int tmc_i2c_smb_block_read_op(struct i2c_adapter *adap, u8 rw, u32 mux,
-					u32 addr, u32 offset, u32 len, u8 *buf)
+static int tmc_i2c_block_delay_rw_op(struct i2c_adapter *adap, u8 rw, u32 mux,
+					u32 addr, u32 offset, bool useoffset,
+					u32 len, u8 *buf)
 {
 	struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
 	int err, i = 0;
 	u32 control = 0, data = 0;
 	u32 start_add;
+    u32 delay = tadap->i2c_delay;
 
 	err = tmc_i2c_mstr_wait_rdy(adap, rw, 0);
 	if (err < 0) {
@@ -630,112 +821,292 @@ static int tmc_i2c_smb_block_read_op(struct i2c_adapter *adap, u8 rw, u32 mux,
 
 	/* initialize the start address and mux */
 	tmc_iowrite(0x00000000, TMC_I2C_MSTR_AUTOMATION_I2C(tadap,
-		    TMC_I2C_MSTR_AUTOMATION_I2C_DPMEM_OFFSET));
+                TMC_I2C_MSTR_AUTOMATION_I2C_DPMEM_OFFSET));
 
 	tmc_iowrite(mux, TMC_I2C_MSTR_I2C_DPMEM(tadap,
-			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_0));
+                TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_0));
 	tmc_iowrite(0x84400000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
-			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_4));
-
-
+                TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_4));
+	/* populate delay */
+	if (delay) {
+        if (delay > 1000) {
+			delay = delay/1000;
+			delay |= (1 << 16);
+        }
+        tmc_iowrite(delay, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8));
+        tmc_iowrite(0x86000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_C));
+    }
 	/* prepare control command */
 	control |= TMC_I2C_CTRL_DEVADDR(addr);
-	control |= TMC_I2C_CTRL_OFFSET(offset);
+	if (useoffset || rw == TMC_I2C_WRITE)
+		control |= TMC_I2C_CTRL_OFFSET(offset);
 
-	/* read */
-	tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
-			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8));
-	control |= TMC_I2C_CTRL_RDCNT(len);;
-	control |= rd_index_to_oper[6];
+	if (rw == TMC_I2C_READ) {
+		/* read */
+		tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10));
+		control |= TMC_I2C_CTRL_RDCNT_LSB(len);
+		if (len >= 64)
+			control |= TMC_I2C_CTRL_RDCNT_MSB(len);
+		if (useoffset)
+			control |= rd_index_to_oper[6];
+		else
+			control |= rd_index_to_oper[5];
 
-	tadap->control = control;
+		tadap->control = control;
+		/* operation control command */
+		tmc_iowrite(control, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_14));
+		/* End commands */
+		tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_18));
+		tmc_iowrite(0x8E000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_1C));
+		tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_20));
+		tmc_iowrite(0x8F000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_24));
+	} else {
+		data = buf[1] << 8 | buf[0];
+		tmc_iowrite(data, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+				TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10));
+		control |= TMC_I2C_CTRL_WRCNT_LSB(len);
+		if (len >= 64)
+			control |= TMC_I2C_CTRL_WRCNT_MSB(len);
 
-	/*
-	 * operation control command
-	 */
-	tmc_iowrite(control, TMC_I2C_MSTR_I2C_DPMEM(tadap,
-			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_C));
+		control |= wr_index_to_oper[4];
 
-	/*
-	 * End commands
-	 */
-	tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
-			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10));
-	tmc_iowrite(0x8E000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
-			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_14));
-	tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
-			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_18));
-	tmc_iowrite(0x8F000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
-			TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_1C));
-
+		tadap->control = control;
+		/* Operation control command */
+		tmc_iowrite(control, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_14));
+		/* Write Data */
+		for (i = 1; i < (len + 1)/2; i++) {
+			if (i * 2 == len + 1)
+				data = buf[i * 2];
+			else
+				data = (buf[i * 2 + 1] << 8) | buf[i * 2];
+			tmc_iowrite(data, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                        TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10 + i * 8));
+			tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                        TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_14 + i * 8));
+			/*
+			* I2C scan logic works at lower freq compared with
+			* PCIe logic. Require approx 1.3 us for continuous
+			* write.
+			*/
+			udelay(2);
+		}
+		/* End commands */
+		tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10 + i * 8));
+		tmc_iowrite(0x8E000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_14 + i++ * 8));
+		tmc_iowrite(0x00000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10 + i * 8));
+		tmc_iowrite(0x8F000000, TMC_I2C_MSTR_I2C_DPMEM(tadap,
+                    TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_14 + i * 8));
+	}
 	tadap->done = false;
-
 	/* fire the transaction */
 	tmc_iowrite(0x00000001, TMC_I2C_MSTR_AUTOMATION_I2C(tadap,
-			TMC_I2C_MSTR_AUTOMATION_I2C_SCAN_OFFSET));
+                TMC_I2C_MSTR_AUTOMATION_I2C_SCAN_OFFSET));
 
 	TMC_I2C_STAT_INC(tadap, go);
 
-	/*
-	 * read a block of data
-	 */
-	start_add = TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_8;
-	while (len > 0) {
-		usleep_range(10000, 12000);
-		data = ioread32(TMC_I2C_MSTR_I2C_DPMEM(tadap, start_add));
-		buf[i] = data & 0xff;
-		buf[i + 1] = (data >> 8) & 0xff;
-		start_add = start_add + 8;
-		i = i + 2;
-		len = len - 2;
+	i = 0;
+	if (rw == TMC_I2C_READ) {
+		/* read a block of data */
+		start_add = TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10;
+		while (i < len) {
+			err = tmc_i2c_mstr_wait_completion_read(adap,
+				start_add, &data);
+			if (err) {
+				if (TMC_I2C_NACK(err))
+					dev_warn(&adap->dev,
+				"i2c read transaction error (0x%08x)\n"
+				"Channel: 0x%08x, device: 0x%08x, byte: %d\n",
+					err, mux, addr, len);
+				else
+					dev_err(&adap->dev,
+				"i2c read transaction error (0x%08x)\n"
+				"Channel: 0x%08x, device: 0x%08x, byte: %d\n",
+					err, mux, addr, len);
+				err = -EIO;
+				break;
+			}
+			buf[i] = data & 0xff;
+			if (i + 1 < len)
+				buf[i + 1] = (data >> 8) & 0xff;
+			start_add = start_add + 8;
+			i = i + 2;
 
-		TMC_I2C_STAT_INC(tadap, rd_cnt);
+			TMC_I2C_STAT_INC(tadap, rd_cnt);
+		}
+	} else {
+		start_add = TMC_I2C_MSTR_I2C_DPMEM_ENTRY_OFFSET_10;
+		while (i < len) {
+			err = tmc_i2c_mstr_wait_completion(adap, start_add);
+			if (err) {
+				if (TMC_I2C_NACK(err)) {
+					dev_warn(&adap->dev,
+				"i2c write transaction error (0x%08x)\n"
+				"Channel: 0x%08x, device: 0x%08x, byte: %d\n",
+					err, mux, addr, len);
+				} else {
+					dev_err(&adap->dev,
+				"i2c write transaction error (0x%08x)\n"
+				"Channel: 0x%08x, device: 0x%08x, byte: %d\n",
+					err, mux, addr, len);
+				}
+				err = -EIO;
+				break;
+			}
+			start_add = start_add + 8;
+			i += 2;
+			TMC_I2C_STAT_INC(tadap, wr_cnt);
+		}
 	}
 
 	/* stop the transaction */
 	tmc_iowrite(0x00000000, TMC_I2C_MSTR_AUTOMATION_I2C(tadap,
-			TMC_I2C_MSTR_AUTOMATION_I2C_SCAN_OFFSET));
+                TMC_I2C_MSTR_AUTOMATION_I2C_SCAN_OFFSET));
+	return err;
+}
+/*
+ * tmc_i2c_block_read - handles i2c block read operations
+ * @adap: the adapter being used.
+ * @msgs: i2c request msgs.
+ * @num: number of i2c msgs, only supports 1 or 2.
+ */
+static int tmc_i2c_block_read(struct i2c_adapter *adap,
+				   struct i2c_msg *msgs, int num)
+{
+	struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
+	int len;
+	u32 offset = 0;
+	bool useoffset = true;
+	struct i2c_msg *msg;
+	int err, i;
+	u8 wbuf[4] = {0};
+	u32 i2c_delay = tadap->i2c_delay;
+
+    if (num == 1) {
+		useoffset = false;
+		msg = &msgs[0];
+	} else if ((num == 2) && !(msgs[0].flags & I2C_M_RD) &&
+		(msgs[1].flags & I2C_M_RD)) {
+		if (msgs[0].len == 1) {
+			offset = msgs[0].buf[0];
+		} else {
+			wbuf[0] = msgs[0].buf[1];
+			useoffset = false;
+			tmc_i2c_rw_op(adap, TMC_I2C_WRITE, tadap->mux_select,
+				      msgs[0].addr, msgs[0].buf[0],
+				      useoffset, 1, wbuf);
+		}
+		msg = &msgs[1];
+	} else {
+		dev_info(&adap->dev, "i2c block read error:"
+			"Maximum 2 i2c msgs supported in a row.\n");
+		return -EINVAL;
+	}
+
+	len = msg->len;
+
+	if (msg->flags & I2C_M_RECV_LEN)
+            len = I2C_SMBUS_BLOCK_MAX;
+
+	if (useoffset) {
+        for (i = 0; len > 0; len -= I2C_SMBUS_BLOCK_MAX) {
+            if (i2c_delay) {
+                err = tmc_i2c_block_delay_rw_op(adap, TMC_I2C_READ,
+                        tadap->mux_select,
+                        msgs[0].addr,
+                        offset + i, useoffset,
+                        (len < I2C_SMBUS_BLOCK_MAX) ?
+                        len : I2C_SMBUS_BLOCK_MAX,
+                        &msg->buf[i]);
+            } else {
+                 err = tmc_i2c_block_rw_op(adap, TMC_I2C_READ,
+                        tadap->mux_select,
+                        msgs[0].addr,
+                        offset + i, useoffset,
+                        (len < I2C_SMBUS_BLOCK_MAX) ?
+                        len : I2C_SMBUS_BLOCK_MAX,
+                        &msg->buf[i]);
+            }
+			if (err < 0)
+                return err;
+
+			i += I2C_SMBUS_BLOCK_MAX;
+		}
+	} else {
+        if (i2c_delay) {
+            err = tmc_i2c_block_delay_rw_op(adap, TMC_I2C_READ,
+                    tadap->mux_select, msgs[0].addr, 0,
+                    useoffset, (len < TMC_I2C_BLOCK_MAX) ?
+                    len : TMC_I2C_BLOCK_MAX,
+                    &msg->buf[0]);
+        } else {
+            err = tmc_i2c_block_rw_op(adap, TMC_I2C_READ,
+                    tadap->mux_select, msgs[0].addr, 0,
+                    useoffset, (len < TMC_I2C_BLOCK_MAX) ?
+                    len : TMC_I2C_BLOCK_MAX,
+                    &msg->buf[0]);
+        }
+		if (err < 0)
+			return err;
+	}
 
 	return 0;
 }
 
-static int tmc_i2c_smb_block_read(struct i2c_adapter *adap,
-				   struct i2c_msg *msgs, int num)
+/*
+ * tmc_i2c_block_write - handles i2c block write
+ * @adap: the adapter being used
+ * @msgs: i2c block write request msgs
+ * @num: number of i2c msgs. Only the first will be handled.
+ *
+ * This handles the i2c block write requests. Only the first request
+ * is going to be handled. The rest will be ignored.
+ */
+static int tmc_i2c_block_write(struct i2c_adapter *adap,
+				struct i2c_msg *msgs, int num)
 {
-	struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
-	int curmsg, len;
-	int offset = 0;
-	struct i2c_msg *msg;
-	int err, i = 0;
-	u8 rwbuf[32] = {0};
-
-	for (curmsg = 0, offset = 0; curmsg < num; curmsg++) {
-		msg = &msgs[curmsg];
-		len = msg->len;
-
-		if (msg->flags & I2C_M_RECV_LEN)
-			len = (I2C_SMBUS_BLOCK_MAX + 1);
-
-		if (msg->flags & I2C_M_RD) {
-			if ((curmsg == 1) && (msg->flags & I2C_M_RECV_LEN) &&
-				!(msgs[0].flags & I2C_M_RD)) {
-				offset = msgs[0].buf[0];
-			}
-
-			err = tmc_i2c_smb_block_read_op(adap, TMC_I2C_READ,
-				tadap->mux_select,
-				msgs[0].addr, offset,
-				32, rwbuf);
-			if (err < 0) {
-				return err;
-			}
-			msg = &msgs[num - 1];
-			for (i = 0; i < len - 1; i++) {
-				msg->buf[i] = rwbuf[i];
-			}
-		}
+    struct tmc_i2c_adapter *tadap = i2c_get_adapdata(adap);
+    int len;
+    struct i2c_msg *msg;
+    int err, i;
+    u32 offset = 0;
+    u32 i2c_delay = tadap->i2c_delay;
+    msg = &msgs[0];
+    len = msg->len;
+    offset = msg->buf[0];
+    i = 0;
+    len = len - 1;
+    for (; len > 0; len -= TMC_I2C_BLOCK_MAX) {
+        if (i2c_delay) {
+            err = tmc_i2c_block_delay_rw_op(adap, TMC_I2C_WRITE,
+                    tadap->mux_select,
+                    msg->addr, offset + i, true,
+                    (len < TMC_I2C_BLOCK_MAX) ?
+                    len : TMC_I2C_BLOCK_MAX,
+                    &msg->buf[1 + i]);
+        } else {
+            err = tmc_i2c_block_rw_op(adap, TMC_I2C_WRITE,
+                    tadap->mux_select,
+                    msg->addr, offset + i, true,
+                    (len < TMC_I2C_BLOCK_MAX) ?
+                    len : TMC_I2C_BLOCK_MAX,
+                    &msg->buf[1 + i]);
+        }
+		if (err < 0)
+			return err;
+		i += TMC_I2C_BLOCK_MAX;
 	}
-
 	return 0;
 }
 
@@ -749,15 +1120,13 @@ static int tmc_i2c_mstr_xfer(struct i2c_adapter *adap,
 	struct i2c_msg *msg;
 	bool read;
 	u8 rwbuf[4] = {0};
-
+	bool useoffset = true;
 	dev_dbg(dev, "Num messages -> %d\n", num);
-
 	/*
 	 * Initialize all vars
 	 */
 	tadap->entries   = 0;
 	tadap->use_block = false;
-
 	for (curmsg = 0; curmsg < num; curmsg++) {
 		msg = &msgs[curmsg];
 		dev_dbg(dev, "[%02d] %d bytes, flag %#02x buf %#02x\n",
@@ -780,11 +1149,10 @@ static int tmc_i2c_mstr_xfer(struct i2c_adapter *adap,
 
 	if (tadap->use_block) {
 		/* Read Block */
-		if ((msg->flags & I2C_M_RD) && (msg->flags & I2C_M_RECV_LEN)) {
-		    err = tmc_i2c_smb_block_read(adap, msgs, num);
-		} else {
-		    err = tmc_i2c_block_read(adap, msgs, num);
-		}
+		if (msg->flags & I2C_M_RD)
+			err = tmc_i2c_block_read(adap, msgs, num);
+		else
+			err = tmc_i2c_block_write(adap, msgs, num);
 		if (err < 0)
 			return err;
 	} else {
@@ -812,8 +1180,17 @@ static int tmc_i2c_mstr_xfer(struct i2c_adapter *adap,
 						rwbuf[n-1] = (msg->buf[n]);
 					len--;
 				} else {
-					/* read operation */
-					continue;
+					if (num == 1) {
+						useoffset = false;
+					} else if (len == 2) {
+						useoffset = false;
+						rwbuf[0] = msg->buf[1];
+						tmc_i2c_rw_op(adap,
+							      TMC_I2C_WRITE,
+							tadap->mux_select,
+							msg->addr, msg->buf[0],
+							true, len - 1, rwbuf);
+					}
 				}
 			}
 		}
@@ -822,7 +1199,7 @@ static int tmc_i2c_mstr_xfer(struct i2c_adapter *adap,
 			/* write */
 			err = tmc_i2c_rw_op(adap, TMC_I2C_WRITE,
 					tadap->mux_select, msgs[0].addr,
-					msgs[0].buf[0], len, rwbuf);
+					msgs[0].buf[0], useoffset, len, rwbuf);
 		} else {
 			/* read */
 				/*
@@ -833,10 +1210,9 @@ static int tmc_i2c_mstr_xfer(struct i2c_adapter *adap,
 				if (msg->flags & I2C_CLIENT_PEC && (len == TMC_I2C_TRANS_LEN + 1)) {
 					len--;
 				}
-
 			err = tmc_i2c_rw_op(adap, TMC_I2C_READ,
 					tadap->mux_select,
-					msgs[0].addr, msgs[0].buf[0],
+					msgs[0].addr, msgs[0].buf[0], useoffset,
 					len, rwbuf);
 			msg = &msgs[num - 1];
 			len = msg->len;
@@ -852,16 +1228,14 @@ static int tmc_i2c_mstr_xfer(struct i2c_adapter *adap,
 		if (err < 0)
 			return err;
 	}
-
 	TMC_I2C_STAT_INCN(tadap, msg_cnt, num);
-
 	return num;
 }
 
 static u32 tmc_i2c_func(struct i2c_adapter *adap)
 {
 	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL
-		| I2C_FUNC_SMBUS_READ_BLOCK_DATA;
+		| I2C_FUNC_SMBUS_BLOCK_DATA | I2C_FUNC_SMBUS_I2C_BLOCK;
 }
 
 static const struct i2c_algorithm tmc_i2c_algo = {
@@ -895,7 +1269,7 @@ static int tmc_i2c_mux_init(struct i2c_adapter *adap)
 
 	tadap->muxc->priv = tadap;
 	for (chan = 0; chan < tadap->mux_channels; chan++) {
-		ret = i2c_mux_add_adapter(tadap->muxc, 0, chan);
+		ret = i2c_mux_add_adapter(tadap->muxc, 0, chan, 0);
 		if (ret) {
 			dev_err(&adap->dev, "Failed to add adapter %d\n", chan);
 			i2c_mux_del_adapters(tadap->muxc);
@@ -912,7 +1286,8 @@ tmc_i2c_init_one(struct tmc_i2c_ctrl *tmc,
 {
 	struct tmc_i2c_adapter *adapter;
 	struct device *dev = tmc->dev;
-	int err;
+	int err, reg;
+	struct device_node *child;
 
 	adapter = devm_kzalloc(dev, sizeof(*adapter), GFP_KERNEL);
 	if (!adapter)
@@ -940,6 +1315,12 @@ tmc_i2c_init_one(struct tmc_i2c_ctrl *tmc,
 	if (err)
 		goto error;
 
+	for_each_child_of_node(dev->of_node, child) {
+		err = of_property_read_u32(child, "reg", &reg);
+		if (!err && master == reg)
+			adapter->adap.dev.of_node = child;
+	}
+
 	err = tmc_i2c_mux_init(&adapter->adap);
 	if (err)
 		goto err_remove;
@@ -964,30 +1345,41 @@ static void tmc_i2c_cleanup_one(struct i2c_adapter *adap)
 
 }
 
-
 static int tmc_i2c_of_init(struct device *dev,
-				struct tmc_i2c_ctrl *tmc, int id)
+				struct tmc_i2c_ctrl *tmc)
 {
+	int err;
+	struct device_node *child;
 	u32 mux_channels, master, num_masters = 0, master_mask = 0;
 	u32 i2c_delay = 0;
 
-        if (!(master_mask & BIT(master)))
-	    num_masters++;
-        master_mask |= BIT(master);
+	err = of_property_read_u32(dev->of_node, "mux-channels", &mux_channels);
+	if (err || !mux_channels || mux_channels > TMC_I2C_MSTR_MAX_GROUPS)
+		return -EINVAL;
 
-        if (id == 0) {
-            /* chassisd */
-	    mux_channels = chd_channel;
-            num_masters = 1;
-	    i2c_delay = 0;
-        } else if (id == 1) {
-            /* pfe */
-	    mux_channels = pfe_channel;
-            num_masters = 1;
-	    i2c_delay = 20;
-        } else {
-            return -EINVAL;
-        }
+	err = of_property_read_u32(dev->of_node, "i2c-delay", &i2c_delay);
+	if (err)
+		return -EINVAL;
+
+	for_each_child_of_node(dev->of_node, child) {
+		if (!of_device_is_compatible(child, "jnx,i2c-mux-tmc"))
+			continue;
+
+		err = of_property_read_u32(child, "reg", &master);
+		if (err) {
+			dev_err(dev, "Failed to find reg property\n");
+			return -EINVAL;
+		}
+		if (master >= TMC_I2C_MASTER_NR_MSTRS) {
+			dev_err(dev,
+				"master %d out of range\n", master);
+			return -EINVAL;
+		}
+
+		if (!(master_mask & BIT(master)))
+			num_masters++;
+		master_mask |= BIT(master);
+	}
 
 	tmc->adap = devm_kcalloc(dev, num_masters,
 				      sizeof(struct i2c_adapter *),
@@ -1010,8 +1402,6 @@ static int tmc_i2c_probe(struct platform_device *pdev)
 	struct i2c_adapter *adap;
 	struct device *dev = &pdev->dev;
 	struct tmc_i2c_ctrl *tmc;
-
-        const struct mfd_cell *cell = mfd_get_cell(pdev);
 
 	/*
 	 * Allocate memory for the Tmc FPGA
@@ -1049,7 +1439,7 @@ static int tmc_i2c_probe(struct platform_device *pdev)
 	tmc->dev = dev;
 	spin_lock_init(&tmc->lock);
 
-	err = tmc_i2c_of_init(dev, tmc, cell->id);
+	err = tmc_i2c_of_init(dev, tmc);
 	if (err)
 		return err;
 
@@ -1077,7 +1467,7 @@ err_remove:
 	return err;
 }
 
-static void tmc_i2c_remove(struct platform_device *pdev)
+static int tmc_i2c_remove(struct platform_device *pdev)
 {
 	struct tmc_i2c_ctrl *tmc = platform_get_drvdata(pdev);
 	int i;
@@ -1087,6 +1477,8 @@ static void tmc_i2c_remove(struct platform_device *pdev)
 
 	for (i = 0; i < tmc->num_masters; i++)
 		tmc_i2c_cleanup_one(tmc->adap[i]);
+
+	return 0;
 }
 
 static struct platform_driver tmc_i2c_driver = {
@@ -1100,6 +1492,6 @@ static struct platform_driver tmc_i2c_driver = {
 
 module_platform_driver(tmc_i2c_driver);
 
-MODULE_DESCRIPTION("Juniper Networks TMC FPGA I2C Accelerator driver");
+MODULE_DESCRIPTION("Juniper  Tmc FPGA I2C Accelerator driver");
 MODULE_AUTHOR("Ashish Bhensdadia <bashish@juniper.net>");
 MODULE_LICENSE("GPL");

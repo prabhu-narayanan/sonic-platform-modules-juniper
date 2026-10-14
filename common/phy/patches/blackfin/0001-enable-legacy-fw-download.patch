@@ -1,0 +1,48 @@
+Blackfin phymod: use the legacy BASE-T broadcast firmware download sequence.
+
+BFIN_2_22 defaults BCM84894 to the FWAPI download path, which segfaults on this
+platform: xgbaset.c drives it from the global PHYMOD access table, but PAI only
+populates that table for the cores it has created, so the master's port list
+walks an entry whose bus pointer is NULL.
+
+  syncd Firmware Version B0-v02-03-05  (294708 bytes)     <- xgbaset.c:501
+  syncd[6181]: segfault at 8 ... in libsai.so.1.0
+
+Selecting the legacy sequence needs both hunks. config.mk alone does not build:
+xgbaset_cfg_seq.h picks the _bcast_fwload_finish() prototype on LEGACY (1 arg)
+while xgbaset.c picks the call on FWAPI first (2 args, line 513), so with both
+macros defined the two files disagree:
+
+  xgbaset.c:513:14: error: too many arguments to function
+                    '_plp_blackfin_xgbaset_bcast_fwload_finish'
+
+The second hunk therefore stops PHYMOD_BLACKFIN_SUPPORT force-defining FWAPI
+when LEGACY was asked for, rather than removing the FWAPI default outright, so
+other chips keep the vendor behaviour. Both issues are raised with Broadcom;
+drop this patch once the FWAPI path is fixed.
+
+diff -urN a/make/config.mk b/make/config.mk
+--- a/make/config.mk	2026-03-03 21:09:33.000000000 +0530
++++ b/make/config.mk	2026-08-23 22:15:56.045399698 +0530
+@@ -91,7 +91,7 @@
+ #TMP_PHYMOD_EPIL_CPPFLAGS += -DMACSEC_BASET_V2_2
+ #TMP_PHYMOD_EPIL_CPPFLAGS += -DBE_HOST
+ #TMP_PHYMOD_EPIL_CPPFLAGS += -DPLP_LMI_BUS_LOCK
+-#TMP_PHYMOD_EPIL_CPPFLAGS += -DPLP_BASE_T_FIRMWARE_DOWNLOAD_LEGACY
++TMP_PHYMOD_EPIL_CPPFLAGS += -DPLP_BASE_T_FIRMWARE_DOWNLOAD_LEGACY
+ #TMP_PHYMOD_EPIL_CPPFLAGS += -DMACSEC_FW_MSG_SECY_INIT
+ #TMP_PHYMOD_EPIL_CPPFLAGS += -DMACSEC_FW_MSG_SECY_STATS
+ #TMP_PHYMOD_EPIL_CPPFLAGS += -DBCM_FIRMWARE_LANE_CONFIG_FIRMWARE_MODE
+diff -urN a/phymod/include/phymod_custom_config.h b/phymod/include/phymod_custom_config.h
+--- a/phymod/include/phymod_custom_config.h	2026-03-03 21:10:23.000000000 +0530
++++ b/phymod/include/phymod_custom_config.h	2026-08-23 22:15:56.077399801 +0530
+@@ -102,7 +102,9 @@
+ 
+ #ifdef  PHYMOD_BLACKFIN_SUPPORT
+ #define PHYMOD_XGBASET_SUPPORT
++#ifndef PLP_BASE_T_FIRMWARE_DOWNLOAD_LEGACY
+ #define BCM_PLP_FIRMWARE_DOWNLOAD_10GBASET_USE_FWAPI
++#endif
+ #define PLP_BASE_T_SPIROM_FIRMWARE
+ #endif
+ 

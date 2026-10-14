@@ -1,0 +1,246 @@
+PAI 4.0 for QFX5120-48T-6C (BCM84894 "blackfin" copper gearbox).
+
+Source changes only -- all build flags are supplied by common/phy/Makefile,
+which scopes every BASE-T/BCM84894 define to the blackfin conditional block so
+that Agera3 and Barchetta, which share this PAI, compile exactly as before.
+
+ - address each BCM84894 lane as an independently MDIO-addressable core
+   (package_base + local_lane); without this only one core per package is
+   configured, so 7 of every 8 copper ports stay down. Gated at runtime on
+   BRCM_PAI_BFIN_SUPPORT(chip_name).
+ - accept SAI_SWITCH_ATTR_MEDIA_TYPE and SAI_PORT_ATTR_FEC_MODE=NONE, and
+   default the system-side interface type to XFI, on BASE-T. Left at NONE the
+   speed set maps to bcm_pm_InterfaceKR and the MAC sees a permanent local
+   fault. Both gated on BRCM_PAI_BFIN_SUPPORT(chip_name).
+ - raise the copper per-package port limit from a hardcoded 1 to the device's
+   reported lane count. max_lanes is read back from the PHY immediately above
+   the check, so this is identical to the previous behaviour on single-lane
+   parts, and the branch is entered only for xgbaset/1G copper PHYs.
+ - accept SAI_SWITCH_ATTR_FIRMWARE_PATH_NAME on BCM84894 instead of rejecting
+   it, so orchagent can select the INTERNAL firmware load method from
+   gearbox_config.json. PAI loads driver-embedded firmware and ignores the
+   path, but rejecting it fails create_switch. chip_name is not resolved until
+   after the attribute loop, so the case only records the attribute index and
+   the BRCM_PAI_BFIN_SUPPORT(chip_name) test is applied once the chip is
+   known; every other PHY keeps the original rejection, unchanged.
+ - route EXT_MDIO_READ/WRITE to the CL45 entry points. This is reached only
+   when EXT_MDIO_APIS is defined, which the Makefile now does solely for
+   blackfin builds; without it the vendor's CL22 mapping is unchanged.
+ - guard the Aperta MACsec warm-shutdown with PLP_MACSEC_SUPPORT so the call
+   is not compiled in when MACsec support is absent.
+
+diff -urN a/inc/brcm_pai_mdio_ipc_client.h b/inc/brcm_pai_mdio_ipc_client.h
+--- a/inc/brcm_pai_mdio_ipc_client.h	2025-11-27 03:36:46.000000000 +0530
++++ b/inc/brcm_pai_mdio_ipc_client.h	2026-08-25 16:30:04.876995629 +0530
+@@ -16,8 +16,11 @@
+         uint32_t number_of_registers, uint32_t *data);
+ sai_status_t mdio_write_cl22(uint64_t platform_context, uint32_t mdio_addr, uint32_t reg_addr,
+         uint32_t number_of_registers, const uint32_t *data);
+-
++#ifdef EXT_MDIO_APIS
++#define EXT_MDIO_READ   mdio_read    /* For CL45 support, use mdio_read */
++#define EXT_MDIO_WRITE  mdio_write   /* For CL45 support, use mdio_write */
++#else
+ #define EXT_MDIO_READ   mdio_read_cl22    /* For CL45 support, use mdio_read */
+ #define EXT_MDIO_WRITE  mdio_write_cl22   /* For CL45 support, use mdio_write */
+-
++#endif
+ #endif /* __MDIO_IPC_CLIENT_H__ */
+diff -urN a/src/brcm_pai_port.c b/src/brcm_pai_port.c
+--- a/src/brcm_pai_port.c	2025-11-27 03:36:46.000000000 +0530
++++ b/src/brcm_pai_port.c	2026-08-25 16:30:04.876995629 +0530
+@@ -119,6 +119,56 @@
+     plp_info->lane_map = port_info->lane_map;
+     plp_info->flags = 0;
+ 
++    /* Some packages (e.g. BCM84894) present each lane as an independently
++     * MDIO-addressable core at <package_base + local_lane>. On those devices
++     * the lane_map does NOT select the core - the MDIO address does - so
++     * addressing the package base leaves every core but one unconfigured.
++     *
++     * Detect that layout from the configuration itself: if the platform has
++     * declared a chip id (phy_init_config_chip_id) at <package_base +
++     * local_lane>, address that core directly and hand EPDM a single-lane
++     * lane_map. Platforms that declare a single chip id per package have no
++     * such entry, so the lookup fails and the package-base behaviour is left
++     * untouched.
++     *
++     * Note the config DB (PAI_MODULE_CFG_PHY, part number 0 in the key) is
++     * used here, not PAI_MODULE_PHY: the latter is populated only by
++     * create_switch(), so it holds just the package bases. Only the address
++     * is overridden - every core in a package shares the MDIO bus of its
++     * base, so the base's platform_ctxt stays valid.
++     */
++    if (BRCM_PAI_BFIN_SUPPORT(port_info->chip_name) &&
++        port_info->lane_map != 0 &&
++        (port_info->lane_map & (port_info->lane_map - 1)) == 0) {
++        /* Single-lane port: lane_map has exactly one bit, and its position is
++         * the local lane number assigned in _brcm_process_hw_lane_list(). */
++        int local_lane = 0;
++        uint32_t lane_map = (uint32_t) port_info->lane_map;
++        pai_phy_t core_cfg;
++        sai_object_id_t core_cfg_obj_id;
++
++        while ((lane_map >>= 1) != 0) {
++            local_lane++;
++        }
++
++        if (local_lane != 0) {
++            /* Kept in a local: BRCM_PAI_CREATE_OBJ_ID() ORs its id argument, so
++             * passing an unparenthesised sum trips -Wparentheses. */
++            int core_addr = phy_id + local_lane;
++
++            core_cfg_obj_id = BRCM_PAI_CREATE_OBJ_ID(SAI_OBJECT_TYPE_SWITCH,
++                0, 0, core_addr);
++            if (pai_db_read_module(PAI_MODULE_CFG_PHY, core_cfg_obj_id, &core_cfg)
++                    == SAI_STATUS_SUCCESS) {
++                plp_info->phy_addr = core_addr;
++                plp_info->lane_map = 0x1;
++                PAI_LOG_DEBUG(SAI_API_PORT, "Per-core addressing: package base %d,"
++                    " local lane %d -> phy_addr %d\n", phy_id, local_lane,
++                    plp_info->phy_addr);
++            }
++        }
++    }
++
+     return SAI_STATUS_SUCCESS;
+ }
+ 
+@@ -409,7 +459,12 @@
+         } else if (attr_list[index].id == SAI_PORT_ATTR_ADMIN_STATE) {
+             port_info.port_attributes.admin_state = attr_list[index].value.booldata;
+         } else if (attr_list[index].id == SAI_PORT_ATTR_MEDIA_TYPE) {
+-            if (brcm_pai_is_1G_phy(port_info.chip_name) == SAI_STATUS_SUCCESS) {
++            if ((brcm_pai_is_1G_phy(port_info.chip_name) == SAI_STATUS_SUCCESS) ||
++                BRCM_PAI_BFIN_SUPPORT(port_info.chip_name)) {
++                /* BCM84894 is copper only, and SONiC always supplies a media
++                 * type when creating a gearbox line port. Record it instead of
++                 * failing the create; it is only programmed into the device for
++                 * 1G PHYs further down. */
+                 /* coverity[mixed_enums] */
+                 port_info.port_attributes.media_type = attr_list[index].value.u32;
+             } else {
+@@ -481,7 +536,17 @@
+             }
+             if ((brcm_pai_is_1G_phy(port_info.chip_name) == SAI_STATUS_SUCCESS)
+                 || (brcm_pai_is_xgbaset_phy(port_info.chip_name) == SAI_STATUS_SUCCESS)) {
+-                return SAI_STATUS_NOT_SUPPORTED;
++                /* BCM84894 has no configurable FEC. SONiC always supplies
++                 * SAI_PORT_ATTR_FEC_MODE on port create (gearsyncd requires
++                 * system_fec/line_fec in the PHY config), so accept the only
++                 * meaningful value, NONE, and ignore it instead of failing the
++                 * whole port create. A genuine request to enable FEC is still
++                 * rejected, as is any FEC request on other PHY families. */
++                if (!BRCM_PAI_BFIN_SUPPORT(port_info.chip_name) ||
++                    port_info.port_attributes.fec_mode != SAI_PORT_FEC_MODE_NONE) {
++                    PAI_LOG_ERROR(SAI_API_PORT, "FEC is not supported on this PHY \n");
++                    return SAI_STATUS_NOT_SUPPORTED;
++                }
+             }
+         } else if (attr_list[index].id == SAI_PORT_ATTR_FEC_MODE_EXTENDED) {
+             if (!port_info.port_attributes.use_extended_fec) {
+@@ -634,10 +699,12 @@
+         }
+         if ((brcm_pai_is_xgbaset_phy(port_info.chip_name) == SAI_STATUS_SUCCESS) ||
+             (brcm_pai_is_1G_phy(port_info.chip_name) == SAI_STATUS_SUCCESS)) {
+-            /* For CU PHYs, there can be only 1 port per PHY */
+-            if (port_count == 1) {
+-                PAI_LOG_ERROR(SAI_API_PORT, "Max system side port limit reached: ports created:%d, max allowed ports: 1\n",
+-                    port_count);
++            /* Copper PHYs carry a single lane per port, so a package supports
++             * as many ports as it has lanes: 1 for single-port devices and 4
++             * for a quad-core part such as the BCM84894. */
++            if (port_count >= max_lanes) {
++                PAI_LOG_ERROR(SAI_API_PORT, "Max system side port limit reached: ports created:%d, max allowed ports:%d\n",
++                    port_count, max_lanes);
+                 return SAI_STATUS_NOT_SUPPORTED;
+             }
+         } else {
+@@ -658,9 +725,11 @@
+         }
+         if ((brcm_pai_is_xgbaset_phy(port_info.chip_name) == SAI_STATUS_SUCCESS) ||
+             (brcm_pai_is_1G_phy(port_info.chip_name) == SAI_STATUS_SUCCESS)) {
+-            if (port_count == 1) {
+-                PAI_LOG_ERROR(SAI_API_PORT, "Max line side port limit reached: ports created:%d, max allowed ports: 1\n",
+-                    port_count);
++            /* Copper PHYs carry a single lane per port -- see the system side
++             * comment above. */
++            if (port_count >= max_lanes) {
++                PAI_LOG_ERROR(SAI_API_PORT, "Max line side port limit reached: ports created:%d, max allowed ports:%d\n",
++                    port_count, max_lanes);
+                 return SAI_STATUS_NOT_SUPPORTED;
+             }
+         } else {
+@@ -3067,6 +3136,20 @@
+         BRCM_PAI_IF_ERR_RETURN(
+             brcm_pai_epdm_cu_config_set_get(line_port_info.chip_name, &line_plp_info, &line_port_info,
+             PAI_API_OP_SET, SAI_PORT_ATTR_SPEED, &ctrl_value_inout));
++        /*
++         * SONiC's orchagent never sends SAI_PORT_ATTR_INTERFACE_TYPE for the
++         * gearbox system-side port, so interface_type stays at
++         * SAI_PORT_INTERFACE_TYPE_NONE (0). The SAI_PORT_ATTR_SPEED set below
++         * still feeds that value through BRCM_PAI_IF_TYPE_EPDM_IF(), whose
++         * default branch maps it to bcm_pm_InterfaceKR. That reconfigures a 10G
++         * serial system side as backplane KR, so the attached MAC sees a
++         * permanent local fault. Default to XFI, which is what the
++         * xgbaset/Blackfin driver uses for a 10G serial system interface.
++         */
++        if (BRCM_PAI_BFIN_SUPPORT(sys_port_info.chip_name) &&
++            sys_port_info.port_attributes.interface_type == SAI_PORT_INTERFACE_TYPE_NONE) {
++            sys_port_info.port_attributes.interface_type = SAI_PORT_INTERFACE_TYPE_XFI;
++        }
+         /* Apply system side configurations for interface type and speed */
+         if (sys_port_info.port_attributes.interface_type > SAI_PORT_INTERFACE_TYPE_NONE) {
+             BRCM_PAI_IF_ERR_RETURN(
+diff -urN a/src/brcm_pai_switch.c b/src/brcm_pai_switch.c
+--- a/src/brcm_pai_switch.c	2025-11-27 03:36:46.000000000 +0530
++++ b/src/brcm_pai_switch.c	2026-08-25 16:30:30.729056075 +0530
+@@ -506,6 +506,7 @@
+     pai_init_t init;
+     sai_status_t rv;
+     int attr_idx = 0, profile_id = 0, idx = 0, boot_type = BOOT_FLAGS_COLD;
++    int firmware_path_attr_idx = -1;
+     bool switch_init = FALSE, bcast_enable = FALSE, bcast_execute = FALSE;
+     bool bcast_fw_verify = FALSE, bcast_disable = FALSE;
+     sai_switch_hardware_access_bus_t hw_access_type = 0;
+@@ -583,7 +584,12 @@
+ #endif
+                 break;
+             case SAI_SWITCH_ATTR_FIRMWARE_PATH_NAME:
+-                return SAI_STATUS_ATTR_NOT_SUPPORTED_0 + attr_idx;
++                /* Cannot be decided here: chip_name is filled in after this
++                 * loop by brcm_pai_get_chip_name_id(), which needs the phy_id
++                 * that SAI_SWITCH_ATTR_SWITCH_HARDWARE_INFO carries, and SAI
++                 * does not order attributes. Record it and decide below. */
++                firmware_path_attr_idx = attr_idx;
++                break;
+             case SAI_SWITCH_ATTR_RESTART_WARM:
+                 return SAI_STATUS_ATTR_NOT_SUPPORTED_0 + attr_idx;
+             case SAI_SWITCH_ATTR_PRE_SHUTDOWN:
+@@ -857,6 +863,14 @@
+         return rv;
+     }
+ 
++    /* BCM84894 loads driver-embedded firmware for the INTERNAL method and
++     * ignores the path, so a firmware path is accepted (and unused) there;
++     * orchagent uses a non-empty path to select that method. Other PHYs keep
++     * the unsupported-attribute behaviour. */
++    if ((firmware_path_attr_idx >= 0) && !BRCM_PAI_BFIN_SUPPORT(chip_name)) {
++        return SAI_STATUS_ATTR_NOT_SUPPORTED_0 + firmware_path_attr_idx;
++    }
++
+     /* Separating out current port and master port address for 10G CU PHYs */
+     if (brcm_pai_is_xgbaset_phy(chip_name) == SAI_STATUS_SUCCESS) {
+         /* This is only populated in master slave FW download mode */
+@@ -1816,9 +1830,11 @@
+          * There are no separate resources saved for PM warmboot so its returning success without taking any action.
+          * */
+         phy_init.restart_warm = attr->value.booldata;
++#if defined(PLP_MACSEC_SUPPORT)
+         if((attr->value.booldata == TRUE) && BRCM_PAI_APERTA_SUPPORT(phy_init.chip_name)) {
+             BRCM_PAI_IF_ERR_RETURN(brcm_pai_warmboot_macsec_shutdown (switch_id));
+         }
++#endif
+     } else if (attr->id == SAI_SWITCH_ATTR_FAILOVER_CONFIG_MODE) {
+         if (BRCM_PAI_MILB_SUPPORT(phy_init.chip_name)) {
+             failover_cfg = attr->value.u32;

@@ -1,0 +1,17 @@
+#!/bin/bash
+#
+# config-setup post-migration hook (sourced, so it must not exit).
+#
+# run-parts only lists names made of letters, digits, '_' and '-', hence no
+# extension. Runs after the old config_db.json is copied into /etc/sonic and
+# before config-setup loads it.
+
+_juniper_migrate="${JUNIPER_CONFIG_MIGRATE:-/usr/local/bin/juniper_config_migrate.py}"
+
+if [ -f "$_juniper_migrate" ]; then
+    python3 "$_juniper_migrate" "${CONFIG_DB_JSON:-/etc/sonic/config_db.json}" ||
+        echo "juniper-config-migrate: failed with status $?"
+fi
+
+unset _juniper_migrate
+return 0

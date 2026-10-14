@@ -1,0 +1,4 @@
+# Build artifacts — created at build time, not tracked
+sonic-dc-jma/
+docker-sonic-dc-jma.gz
+docker-sonic-dc-jma-dbg.gz

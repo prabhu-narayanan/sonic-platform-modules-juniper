@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+PSU Status Daemon - Extended Fault Monitoring
+Monitors PSU PMBus status registers and adds fault details to STATE_DB
+Works alongside standard psud daemon
+"""
+
+import sys
+import time
+import signal
+from datetime import datetime
+
+# SONiC paths
+sys.path.insert(0, '/usr/local/lib/python3.11/dist-packages')
+sys.path.insert(0, '/usr/lib/python3/dist-packages')
+
+from sonic_py_common import daemon_base
+from swsscommon import swsscommon
+import sonic_platform.platform
+
+SYSLOG_IDENTIFIER = "psuStatusd"
+UPDATE_PERIOD_SECS = 3
+PSU_INFO_TABLE = 'PSU_INFO'
+
+
+class PsuStatusDaemon(daemon_base.DaemonBase):
+    """PSU status-monitoring daemon with full input/output telemetry"""
+
+    def __init__(self):
+        super().__init__(SYSLOG_IDENTIFIER)
+        self.set_min_log_priority_info()
+        #get chassis to fetch Psu objects
+        self._chassis = sonic_platform.platform.Platform().get_chassis()
+
+        # Track previous status for change detection
+        self.prev_status = {}
+        # One-time per-PSU input feed check
+        self.input_feed_checked = {0: False, 1: False}
+
+        # Connect to STATE_DB
+        try:
+            self.state_db = daemon_base.db_connect("STATE_DB")
+            self.log_info("Connected to State DB successfully")
+        except Exception as e:
+            self.log_error(f"Failed to connect to State DB: {e}")
+            sys.exit(1)
+
+        self.running = True
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+
+    def _signal_handler(self, sig, frame):
+        self.log_info(f"Caught signal {sig}, shutting down gracefully...")
+        self.running = False
+
+    def run(self):
+        self.log_info("PSU Status Daemon starting - monitoring telemetry and status")
+
+        while self.running:
+            try:
+                # Monitor both PSUs (indexed 0, 1)
+                for psu_index in range(self._chassis.get_num_psus()):
+                    self._update_psu(psu_index)
+            except Exception as e:
+                self.log_error(f"Error updating PSU status: {e}")
+            time.sleep(UPDATE_PERIOD_SECS)
+
+        self.log_info("PSU Status Daemon shutting down...")
+
+    def _update_psu(self, psu_index):
+        """Update all telemetry and fault status fields for one PSU"""
+        psu = self._chassis.get_psu(psu_index)
+        psu_key = f"PSU{psu_index + 1}"
+        table_key = f"{PSU_INFO_TABLE}|{psu_key}"
+
+        if not psu.get_presence():
+            return
+
+        try:
+            # ONE-TIME INPUT FEED CHECK (per boot)
+            if not self.input_feed_checked[psu_index]:
+                feed_ok, feed_fault = psu.get_input_feed_status()
+                if not feed_ok:
+                    self.log_error(f"{psu_key} input feed failure: {feed_fault}")
+                else:
+                    self.log_info(f"{psu_key} input feed OK")
+                self.state_db.hset(table_key, 'input_feed_status', 'OK' if feed_ok else 'Fault')
+                self.state_db.hset(table_key, 'input_feed_fault', feed_fault if feed_fault != 'N/A' else 'N/A')
+                self.state_db.hset(table_key, 'input_feed_checked', 'true')
+                self.input_feed_checked[psu_index] = True
+
+            # CONTINUOUS MONITORING (major status bits, per EVO/SONiC)
+            statuses = {
+                'input_voltage': psu.get_input_voltage_status(),
+                'output_voltage': psu.get_output_voltage_status(),
+                'output_current': psu.get_output_current_status(),
+                'temp_fault': psu.get_temperature_status(),
+                'fan': psu.get_fan_status()
+            }
+
+            for status_name, (status_ok, fault_desc) in statuses.items():
+                prev_key = f"{psu_index}_{status_name}"
+                prev_ok = self.prev_status.get(prev_key, True)
+
+                if status_ok != prev_ok:
+                    if status_ok:
+                        self.log_notice(f"{psu_key} {status_name} fault cleared")
+                    else:
+                        self.log_warning(f"{psu_key} {status_name} fault: {fault_desc}")
+                    self.prev_status[prev_key] = status_ok
+
+                self.state_db.hset(table_key, f'{status_name}_status', 'OK' if status_ok else 'Fault')
+                self.state_db.hset(table_key, f'{status_name}_fault', fault_desc if fault_desc != 'N/A' else 'N/A')
+
+            
+            # Diagnostic: calculated output power (optional, not for CLI)
+            try:
+                output_power_calc = psu.get_power_calculated()
+            except Exception as e:
+                output_power_calc = 0.0
+            self.state_db.hset(table_key, "output_power_calc", str(output_power_calc))
+
+            # Update fault monitoring timestamp
+            self.state_db.hset(table_key, 'fault_monitoring_updated', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+        except Exception as e:
+            self.log_error(f"{psu_key}: Failed to update status - {e}")
+
+
+def main():
+    daemon = PsuStatusDaemon()
+    daemon.run()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+# =============================================================================
+# jmd-dispatcher — SONiC host-side dispatcher for JMD_CMD_EVENTS (Redis Streams)
+# =============================================================================
+#
+# Architecture:
+#   This daemon is a long-running systemd service (jmd-dispatcher.service)
+#   that sits on the SONiC host and listens to a Redis Stream for command
+#   requests originating from the JMD container.
+#
+# How it works:
+#   1. JMD (container) writes a job hash JMD_CMD|<uuid> with state=READY
+#      into STATE_DB and then XADDs {uuid: <uuid>} to the JMD_CMD_EVENTS
+#      stream.
+#   2. This dispatcher reads the stream via a consumer group.  For each
+#      UUID, it verifies the job hash is still READY and spawns a
+#      short-lived worker process:
+#          jmd-cmdrunner --uuid <uuid>
+#      The worker handles atomic claiming, command execution, and result
+#      recording.
+#   3. After a successful spawn the stream entry is ACK'd.
+#   4. A periodic reclaim pass uses XAUTOCLAIM to recover entries that
+#      were delivered but never ACK'd (e.g. because the dispatcher
+#      crashed between receive and spawn).
+#
+# SONiC integration:
+#   - Uses swsscommon.DBConnector + swsscommon.Table for all hash reads
+#     (job state checks), following the standard SONiC daemon design
+#     pattern.
+#   - DBConnector returns decoded strings, so no manual byte decoding
+#     is needed.
+#   - For Redis Streams operations (XREADGROUP, XACK, XAUTOCLAIM,
+#     XGROUP_CREATE) we use a raw redis-py client because the swsscommon
+#     C++ binding does not wrap the Redis Streams API.
+#   - Signal handling follows the standard SONiC daemon convention:
+#         sys.exit(128 + signum)
+#   - Logging via syslog, following standard SONiC conventions.
+#
+# Configuration (environment variables, all optional):
+#   JMD_STREAM          Stream name              (default: JMD_CMD_EVENTS)
+#   JMD_GROUP           Consumer group name       (default: cmd)
+#   JMD_CONSUMER        Consumer name             (default: hostname)
+#   BLOCK_MS            xreadgroup block time ms  (default: 5000)
+#   COUNT               Max entries per read      (default: 16)
+#   IDLE_RECLAIM_MS     Reclaim idle threshold ms (default: 60000)
+#   RECLAIM_BATCH       Max entries per reclaim   (default: 32)
+#   MAX_PROCS           Concurrent worker cap     (default: 8)
+#   USE_SYSTEMD         Use systemd-run? "1"/"0"  (default: 1)
+#   WORKER_PATH         Path to jmd-cmdrunner     (default: /usr/local/bin/jmd-cmdrunner)
+#
+# Concurrency:
+#   MAX_PROCS caps the number of in-flight workers on the host side,
+#   independent of any container-side semaphore.  A threading.Semaphore
+#   gates spawn_worker() so the main loop blocks (rather than queuing
+#   unbounded) when the cap is hit.
+#
+# Security (POC):
+#   - Workers run as root via systemd transient units.
+#   - The command_text is ultimately executed with shell=True by the
+#     worker — production should use an argv allowlist.
+# =============================================================================
+
+import os
+import signal
+import socket
+import subprocess
+import sys
+import syslog
+import threading
+import time
+
+# ---------------------------------------------------------------------------
+# SONiC imports — swsscommon is the standard SONiC Redis abstraction layer
+# (C++ SWIG-wrapped).  We guard the import so the script can at least start
+# and emit a clear syslog error if the package is missing.
+# ---------------------------------------------------------------------------
+try:
+    from swsscommon.swsscommon import DBConnector, Table
+    HAS_SWSSCOMMON = True
+except ImportError:
+    DBConnector = None
+    Table = None
+    HAS_SWSSCOMMON = False
+
+# redis-py is needed for Streams API (XREADGROUP, XACK, XAUTOCLAIM,
+# XGROUP_CREATE) and error handling.  On SONiC it is always installed.
+try:
+    import redis
+except ImportError:
+    redis = None
+
+
+# ---------------------------------------------------------------------------
+# Configuration — all from environment, with sensible defaults
+# ---------------------------------------------------------------------------
+
+STREAM          = os.environ.get("JMD_STREAM",      "JMD_CMD_EVENTS")
+GROUP           = os.environ.get("JMD_GROUP",        "cmd")
+CONSUMER        = os.environ.get("JMD_CONSUMER",     socket.gethostname() or "host")
+BLOCK_MS        = int(os.environ.get("BLOCK_MS",     "5000"))
+COUNT           = int(os.environ.get("COUNT",        "16"))
+IDLE_RECLAIM_MS = int(os.environ.get("IDLE_RECLAIM_MS", "60000"))
+RECLAIM_BATCH   = int(os.environ.get("RECLAIM_BATCH",   "32"))
+MAX_PROCS       = int(os.environ.get("MAX_PROCS",       "8"))
+USE_SYSTEMD     = os.environ.get("USE_SYSTEMD", "1") == "1"
+WORKER_PATH     = os.environ.get("WORKER_PATH",
+                                  "/usr/local/bin/jmd-cmdrunner")
+
+# SONiC database constants.
+STATE_DB_NAME   = "STATE_DB"        # DB name for DBConnector
+STATE_DB_ID     = 6                 # DB index for raw redis-py
+TABLE_NAME      = "JMD_CMD"        # Table name in STATE_DB
+LOGTAG          = "jmd-dispatcher"  # syslog ident tag
+
+# Redis Unix socket path — used for the raw redis-py client that handles
+# Streams.  The DBConnector reads connection info from database_config.json.
+REDIS_UNIX_SOCK = "/var/run/redis/redis.sock"
+
+
+# ---------------------------------------------------------------------------
+# Signal handling  (standard SONiC convention: sys.exit(128 + sig))
+# ---------------------------------------------------------------------------
+
+# Threading Event used by the main loop to break cleanly on signal.
+stop_event = threading.Event()
+
+
+def signal_handler(sig, _frame):
+    """
+    Handle SIGTERM / SIGINT: log and request clean shutdown.
+
+    We set the stop_event so the main loop exits after the current
+    xreadgroup block finishes.  For the long-running dispatcher we
+    do NOT call sys.exit() directly — that would bypass cleanup and
+    leave the consumer group in a dirty state.  Instead, the main
+    loop checks stop_event and returns normally.
+    """
+    signame = {signal.SIGTERM: "SIGTERM", signal.SIGINT: "SIGINT"}.get(sig, str(sig))
+    log_info("signal '{}' caught — requesting shutdown".format(signame))
+    stop_event.set()
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def log_info(msg):
+    """Log an informational message to syslog."""
+    syslog.syslog(syslog.LOG_INFO, "{}: {}".format(LOGTAG, msg))
+
+
+def log_err(msg):
+    """Log an error message to syslog."""
+    syslog.syslog(syslog.LOG_ERR, "{}: {}".format(LOGTAG, msg))
+
+
+def log_warning(msg):
+    """Log a warning message to syslog."""
+    syslog.syslog(syslog.LOG_WARNING, "{}: {}".format(LOGTAG, msg))
+
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+def connect_state_db():
+    """
+    Connect to STATE_DB via swsscommon.DBConnector, following the
+    standard SONiC daemon design pattern.
+
+    Returns a tuple of (tbl, raw):
+        tbl — swsscommon.Table bound to "JMD_CMD" for hash reads
+        raw — redis.Redis for Redis Streams (xreadgroup, xack, etc.)
+
+    We need two handles because:
+      - DBConnector + Table is the standard SONiC pattern for hash
+        operations (hget, hset, hgetall).  It returns decoded strings
+        and handles the table-separator convention.
+      - The swsscommon C++ binding does NOT wrap Redis Streams commands
+        (XREADGROUP, XACK, XAUTOCLAIM, XGROUP_CREATE), so we use a
+        raw redis-py client for those.
+
+    The raw client uses decode_responses=True so stream field data
+    comes back as str (not bytes), keeping things simple.
+    """
+    # Standard SONiC pattern: DBConnector(db_name, timeout)
+    state_db = DBConnector(STATE_DB_NAME, 0)
+    tbl = Table(state_db, TABLE_NAME)
+
+    # Raw redis-py client for Streams — decode_responses=True so we
+    # get str back from xreadgroup/xautoclaim instead of bytes.
+    raw = redis.Redis(unix_socket_path=REDIS_UNIX_SOCK, db=STATE_DB_ID,
+                      decode_responses=True)
+
+    log_info("connected to STATE_DB via DBConnector + Table('{}')".format(
+        TABLE_NAME))
+    return tbl, raw
+
+
+def get_job_state(tbl, uuid):
+    """
+    Read the 'state' field of a JMD_CMD|<uuid> hash.
+
+    Uses Table.hget(key, field) which returns (bool, str).
+    The bool is True if the field exists, False otherwise.
+
+    Args:
+        tbl:  swsscommon.Table instance bound to "JMD_CMD"
+        uuid: Job UUID string
+
+    Returns:
+        str ("READY", "INPROGRESS", "COMPLETE", "FAILED") or None.
+    """
+    found, val = tbl.hget(uuid, "state")
+    if not found:
+        return None
+    return val
+
+
+# ---------------------------------------------------------------------------
+# Consumer group setup
+# ---------------------------------------------------------------------------
+
+def ensure_group(raw):
+    """
+    Create the consumer group on the stream if it doesn't already exist.
+
+    Uses XGROUP CREATE with id="$" so only NEW messages (posted after
+    the group is created) are delivered to consumers.  mkstream=True
+    creates the stream key if it doesn't exist yet.
+
+    If the group already exists Redis returns a BUSYGROUP error, which
+    we silently ignore.
+
+    Args:
+        raw: redis.Redis client (for Streams commands)
+    """
+    try:
+        raw.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
+        log_info("created consumer group '{}' on stream '{}'".format(GROUP, STREAM))
+    except redis.ResponseError as e:
+        if "BUSYGROUP" in str(e):
+            # Group already exists — normal on restart.
+            log_info("consumer group '{}' already exists".format(GROUP))
+        else:
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Worker spawning
+# ---------------------------------------------------------------------------
+
+# Semaphore gates concurrent workers (host-side concurrency cap).
+sem = threading.Semaphore(MAX_PROCS)
+
+
+def systemd_run(uuid):
+    """
+    Spawn jmd-cmdrunner as a systemd transient unit.
+
+    Advantages over a raw Popen:
+      - systemd tracks the process lifecycle (journalctl, systemctl status)
+      - RuntimeMaxSec provides a hard kill timeout (safety valve)
+      - --collect garbage-collects the unit on exit
+      - Resource controls can be added via --property= flags
+
+    Args:
+        uuid: Job UUID string (passed as --uuid to the worker)
+
+    Raises:
+        subprocess.CalledProcessError if systemd-run itself fails.
+    """
+    unit = "jmd-cmd@{}.service".format(uuid)
+    cmd = [
+        "systemd-run",
+        "--unit", unit,
+        "--property=RuntimeMaxSec=900",
+        "--collect",
+        WORKER_PATH, "--uuid", uuid,
+    ]
+    subprocess.check_call(cmd, close_fds=True)
+
+
+def popen_run(uuid):
+    """
+    Spawn jmd-cmdrunner as a plain child process (fallback).
+
+    Used when USE_SYSTEMD is False (e.g. in test environments without
+    full systemd support).
+
+    Args:
+        uuid: Job UUID string
+    """
+    subprocess.Popen([WORKER_PATH, "--uuid", uuid], close_fds=True)
+
+
+def spawn_worker(uuid):
+    """
+    Spawn a worker for the given UUID using the configured method.
+
+    The caller must hold the semaphore (sem) before calling this.
+
+    Args:
+        uuid: Job UUID string
+    """
+    if USE_SYSTEMD:
+        systemd_run(uuid)
+    else:
+        popen_run(uuid)
+
+
+# ---------------------------------------------------------------------------
+# Stream entry processing
+# ---------------------------------------------------------------------------
+
+def process_entry(tbl, raw, eid, fields):
+    """
+    Process a single stream entry: validate, check job state, spawn worker.
+
+    Steps:
+      1. Extract the 'uuid' field from the stream entry.
+      2. If missing → malformed entry; ACK and skip.
+      3. Read the job hash state via Table.hget().
+      4. If not READY → already claimed/completed; ACK and skip.
+      5. Acquire the semaphore (blocks if MAX_PROCS workers in flight).
+      6. Spawn the worker via systemd-run or Popen.
+      7. ACK the stream entry on successful spawn.
+      8. On spawn failure → leave unACK'd for reclaim_stuck().
+
+    Args:
+        tbl:    swsscommon.Table (for hash reads)
+        raw:    redis.Redis (for xack)
+        eid:    Stream entry ID (str, since decode_responses=True)
+        fields: dict of stream entry fields (str keys/values)
+    """
+    # Extract UUID from the stream entry fields.
+    uuid = fields.get("uuid")
+    if not uuid:
+        # Malformed entry (no uuid field) — ACK to remove from PEL.
+        raw.xack(STREAM, GROUP, eid)
+        log_warning("malformed stream entry {} — no uuid field; acked".format(eid))
+        return
+
+    # Check if the job hash is still READY.  The worker does its own
+    # atomic claim (WATCH/MULTI/EXEC), but pre-checking here avoids
+    # spawning a process that will immediately exit.
+    state = get_job_state(tbl, uuid)
+    if state != "READY":
+        raw.xack(STREAM, GROUP, eid)
+        log_info("uuid={} state={} (not READY); acked entry {}".format(
+            uuid, state, eid))
+        return
+
+    # Spawn worker — semaphore blocks if MAX_PROCS already in flight.
+    try:
+        with sem:
+            spawn_worker(uuid)
+        raw.xack(STREAM, GROUP, eid)
+        log_info("spawned uuid={} id={}".format(uuid, eid))
+    except Exception as e:
+        # Leave unACK'd — reclaim_stuck() will retry later.
+        log_err("spawn failed uuid={} id={}: {}".format(uuid, eid, e))
+
+
+# ---------------------------------------------------------------------------
+# Reclaim stuck entries
+# ---------------------------------------------------------------------------
+
+def reclaim_stuck(tbl, raw):
+    """
+    Recover stream entries that were delivered to a consumer but never
+    ACK'd (e.g. because the dispatcher crashed between receive and spawn).
+
+    Uses XPENDING_RANGE (without the ``idle`` kwarg, which requires
+    redis-py >= 4.2.0 — not available on all SONiC images) to list
+    pending entries, filters client-side by idle time, then XCLAIMs
+    those that exceed the threshold.
+
+    Args:
+        tbl: swsscommon.Table (for hash reads)
+        raw: redis.Redis (for xpending_range, xclaim, xack)
+
+    Returns:
+        int — number of entries reclaimed (ACK'd or re-spawned).
+    """
+    reclaimed = 0
+    try:
+        # XPENDING_RANGE without idle filter — returns ALL pending entries
+        # up to RECLAIM_BATCH.  Each entry is a dict with keys:
+        #   message_id, consumer, time_since_delivered, times_delivered
+        pending = raw.xpending_range(
+            STREAM, GROUP,
+            min="-",
+            max="+",
+            count=RECLAIM_BATCH,
+        )
+
+        if not pending:
+            return 0
+
+        # Client-side idle filter: only reclaim entries that have been
+        # pending longer than IDLE_RECLAIM_MS.
+        idle_ids = [
+            entry["message_id"] for entry in pending
+            if entry.get("time_since_delivered", 0) >= IDLE_RECLAIM_MS
+        ]
+
+        if not idle_ids:
+            return 0
+
+        # XCLAIM transfers ownership and returns the full entries with fields.
+        entries = raw.xclaim(
+            STREAM, GROUP, CONSUMER,
+            min_idle_time=IDLE_RECLAIM_MS,
+            message_ids=idle_ids,
+        )
+
+        for eid, fields in entries:
+            uuid = fields.get("uuid")
+            if not uuid:
+                # Malformed entry — ACK to drop from PEL.
+                raw.xack(STREAM, GROUP, eid)
+                reclaimed += 1
+                log_warning("reclaim: malformed entry {} — no uuid; acked".format(eid))
+                continue
+
+            # Check job hash state — if not READY, just ACK and move on.
+            state = get_job_state(tbl, uuid)
+            if state != "READY":
+                raw.xack(STREAM, GROUP, eid)
+                reclaimed += 1
+                log_info("reclaim: uuid={} state={} (not READY); acked".format(
+                    uuid, state))
+                continue
+
+            # Try to spawn; on success ACK.  On failure leave pending for
+            # the next reclaim cycle.
+            try:
+                with sem:
+                    spawn_worker(uuid)
+                raw.xack(STREAM, GROUP, eid)
+                log_info("reclaim: spawned uuid={} id={}".format(uuid, eid))
+                reclaimed += 1
+            except Exception as e:
+                log_err("reclaim: spawn failed uuid={} id={}: {}".format(
+                    uuid, eid, e))
+
+    except redis.ResponseError as e:
+        # Stream might not exist yet (first boot) or be empty.
+        log_warning("reclaim: ResponseError (may be benign): {}".format(e))
+    except Exception as e:
+        # Log unexpected errors instead of silently swallowing them.
+        log_err("reclaim: unexpected error: {}".format(e))
+
+    return reclaimed
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main():
+    """
+    Dispatcher main — connect to DB, consume stream, spawn workers.
+
+    Follows the standard SONiC daemon pattern:
+      1. Register signal handlers
+      2. Open syslog
+      3. Connect to DB
+      4. Enter event loop
+      5. Clean shutdown on signal
+    """
+    # -- Signal handling (standard SONiC convention) --------------------------
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT,  signal_handler)
+
+    syslog.openlog(LOGTAG, syslog.LOG_PID)
+
+    # -- Verify required modules ----------------------------------------------
+    if not HAS_SWSSCOMMON:
+        log_err("swsscommon module not available — cannot start")
+        syslog.closelog()
+        return 1
+
+    if redis is None:
+        log_err("redis-py module not installed — cannot start")
+        syslog.closelog()
+        return 1
+
+    # -- Connect to STATE_DB -------------------------------------------------
+    # DBConnector + Table for hash ops (standard SONiC pattern).
+    # Raw redis-py for Streams (no swsscommon wrapper exists).
+    # Retry connection on startup (Redis may not be ready yet after boot).
+    tbl = None
+    raw = None
+    while not stop_event.is_set():
+        try:
+            tbl, raw = connect_state_db()
+            break
+        except Exception as e:
+            log_warning("waiting for STATE_DB: {}".format(e))
+            time.sleep(2)
+
+    if stop_event.is_set():
+        log_info("shutdown requested before DB connected")
+        syslog.closelog()
+        return 0
+
+    # -- Create consumer group -----------------------------------------------
+    ensure_group(raw)
+
+    log_info(
+        "up: stream={} group={} consumer={} max_procs={} systemd={}".format(
+            STREAM, GROUP, CONSUMER, MAX_PROCS, USE_SYSTEMD))
+
+    # -- Event loop -----------------------------------------------------------
+    # Each iteration:
+    #   (a) XREADGROUP — block up to BLOCK_MS for new entries
+    #   (b) Process each entry (validate, check state, spawn worker)
+    #   (c) XAUTOCLAIM — reclaim entries that were never ACK'd
+    while not stop_event.is_set():
+
+        # -- (a) Read new stream entries -------------------------------------
+        try:
+            resp = raw.xreadgroup(
+                GROUP, CONSUMER,
+                {STREAM: ">"},    # ">" = only new, undelivered entries
+                count=COUNT,
+                block=BLOCK_MS,
+            )
+        except redis.ResponseError as e:
+            # Handle server-side UNBLOCKED when the stream key disappears
+            # (e.g. during warm-reboot or CONFIG_DB reload).
+            if "UNBLOCKED" in str(e) and "no longer exists" in str(e):
+                log_info("stream absent during block; re-creating group")
+                try:
+                    ensure_group(raw)
+                except Exception as eg:
+                    log_warning("re-create group failed: {}".format(eg))
+                time.sleep(0.5)
+                continue
+            log_err("xreadgroup error: {}".format(e))
+            time.sleep(0.5)
+            continue
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            # Redis restarted or transient network issue — back off and
+            # reconnect.  This handles the case where the Redis socket
+            # goes away (e.g. redis-server restart during image upgrade).
+            log_warning("redis connection error: {}; reconnecting".format(e))
+            time.sleep(2)
+            try:
+                tbl, raw = connect_state_db()
+                ensure_group(raw)
+                log_info("reconnected to STATE_DB")
+            except Exception as re_err:
+                log_err("reconnect failed: {}".format(re_err))
+            continue
+
+        # -- (b) Process entries ---------------------------------------------
+        if resp:
+            for _stream_name, entries in resp:
+                for eid, fields in entries:
+                    process_entry(tbl, raw, eid, fields)
+
+        # -- (c) Reclaim stuck entries ---------------------------------------
+        try:
+            reclaim_stuck(tbl, raw)
+        except Exception as e:
+            log_err("reclaim_stuck top-level error: {}".format(e))
+
+    # -- Shutdown -------------------------------------------------------------
+    log_info("exiting cleanly")
+    syslog.closelog()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

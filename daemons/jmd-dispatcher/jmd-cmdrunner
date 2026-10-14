@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+# =============================================================================
+# jmd-cmdrunner — short-lived per-UUID worker for JMD commands (SONiC host)
+# =============================================================================
+#
+# Architecture:
+#   This script is a one-shot worker process.  It is spawned by
+#   jmd-dispatcher (via systemd-run) once per command UUID.
+#
+# Lifecycle:
+#   1. jmd-dispatcher reads a UUID from the JMD_CMD_EVENTS Redis Stream.
+#   2. jmd-dispatcher spawns:  jmd-cmdrunner --uuid <uuid>
+#   3. This script:
+#        a) Connects to STATE_DB via swsscommon.DBConnector + Table,
+#           following the standard SONiC daemon design pattern.
+#        b) Reads the job hash  JMD_CMD|<uuid>
+#        c) Atomically transitions  state: READY -> INPROGRESS
+#           (optimistic lock via WATCH/MULTI/EXEC on a raw redis-py
+#            client, since swsscommon does not expose Redis transactions)
+#        d) Executes the command_text field as a shell command
+#        e) Writes exit_code, output, finished_at, and state back to
+#           the hash via Table.set()
+#        f) Exits — the process is intentionally short-lived
+#
+# Redis key layout — JMD_CMD|<uuid>  (STATE_DB, db 6):
+#
+#   Fields set by JMD (the container-side producer):
+#     state           READY
+#     command_text    <raw command string>     # POC: executed with shell=True
+#     output          ""                       # placeholder; filled by worker
+#     exit_code       -1                       # placeholder; filled by worker
+#     created_at      <RFC 3339 UTC timestamp>
+#
+#   Fields set by this worker:
+#     state           INPROGRESS -> COMPLETE | FAILED
+#     exit_code       child return code; 124 = timeout; 127 = worker error
+#     finished_at     <RFC 3339 UTC timestamp>
+#     output          combined stdout + stderr  (full, no truncation)
+#
+# Exit codes returned by **this script** (not the child command):
+#     0   job completed (success or failure recorded in Redis)
+#     2   job hash missing or malformed (no command_text)
+#     3   cannot connect to Redis / swsscommon not available
+#
+# Security (POC):
+#   - shell=True — for production, switch to an explicit argv allowlist
+#     and shell=False.
+#   - The child runs as root (same as the systemd transient unit).
+#
+# Environment variables:
+#   JMD_CMD_TIMEOUT_SEC   Max wall-clock seconds per command (default 900)
+#
+# SONiC integration:
+#   - Uses swsscommon.DBConnector + swsscommon.Table for STATE_DB access,
+#     following the standard SONiC daemon design pattern.
+#   - DBConnector returns decoded strings, so no manual byte decoding
+#     is needed.
+#   - Falls back to raw redis-py for WATCH/MULTI/EXEC (the swsscommon
+#     C++ binding does not expose Redis transactions).
+#   - Logging via syslog, following standard SONiC conventions.
+# =============================================================================
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import syslog
+import time
+from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# SONiC imports — swsscommon is the standard SONiC Redis abstraction layer
+# (C++ SWIG-wrapped).  We guard the import so the script can at least start
+# and emit a clear syslog error if the package is somehow missing.
+# ---------------------------------------------------------------------------
+try:
+    from swsscommon.swsscommon import DBConnector, Table
+    HAS_SWSSCOMMON = True
+except ImportError:
+    DBConnector = None
+    Table = None
+    HAS_SWSSCOMMON = False
+
+# redis-py is needed only for the WATCH/MULTI/EXEC transaction in
+# atomic_claim().  On SONiC it is always installed system-wide.
+try:
+    import redis
+except ImportError:
+    redis = None
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# SONiC database index for STATE_DB.
+STATE_DB_NAME = "STATE_DB"                          # DB name for DBConnector
+STATE_DB_ID  = 6                                    # DB index for raw redis-py
+TABLE_NAME   = "JMD_CMD"                            # Table name in STATE_DB
+LOGTAG       = "jmd-cmdrunner"                      # syslog ident tag
+
+# Default max wall-clock time for a single command (seconds).
+# Overridable via the JMD_CMD_TIMEOUT_SEC environment variable.
+DEFAULT_TIMEOUT = int(os.environ.get("JMD_CMD_TIMEOUT_SEC", "900"))
+
+# Redis Unix socket path — used only for the raw redis-py client in
+# atomic_claim().  The DBConnector reads this from database_config.json.
+REDIS_UNIX_SOCK = "/var/run/redis/redis.sock"
+
+
+# ---------------------------------------------------------------------------
+# Signal handling  (standard SONiC convention: sys.exit(128 + sig))
+# ---------------------------------------------------------------------------
+
+def signal_handler(sig, frame):
+    """Handle SIGTERM / SIGINT: log and exit with 128+sig."""
+    if sig == signal.SIGTERM:
+        syslog.syslog(syslog.LOG_INFO,
+                       "{}: signal 'SIGTERM' caught, exiting...".format(LOGTAG))
+        sys.exit(128 + sig)
+    elif sig == signal.SIGINT:
+        syslog.syslog(syslog.LOG_INFO,
+                       "{}: signal 'SIGINT' caught, exiting...".format(LOGTAG))
+        sys.exit(128 + sig)
+    else:
+        syslog.syslog(syslog.LOG_INFO,
+                       "{}: unexpected signal {} — ignoring".format(LOGTAG, sig))
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def log_info(msg):
+    """Log an informational message to syslog."""
+    syslog.syslog(syslog.LOG_INFO, "{}: {}".format(LOGTAG, msg))
+
+
+def log_err(msg):
+    """Log an error message to syslog."""
+    syslog.syslog(syslog.LOG_ERR, "{}: {}".format(LOGTAG, msg))
+
+
+def log_warning(msg):
+    """Log a warning message to syslog."""
+    syslog.syslog(syslog.LOG_WARNING, "{}: {}".format(LOGTAG, msg))
+
+
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
+
+def rfc3339_now():
+    """Return current UTC time as RFC 3339 (e.g. '2026-03-25T12:00:00Z')."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# swsscommon Table helpers
+# ---------------------------------------------------------------------------
+
+def get_job_fields(tbl, uuid):
+    """
+    Read all fields from a JMD_CMD|<uuid> hash via swsscommon.Table.
+
+    Table.get(key) returns (bool, [(field, value), ...]).
+    The bool is True if the key exists, False otherwise.
+
+    Args:
+        tbl:  swsscommon.Table instance bound to "JMD_CMD"
+        uuid: Job UUID string (the key within the table)
+
+    Returns:
+        dict {field: value} with str keys/values, or None if missing.
+    """
+    found, fvs = tbl.get(uuid)
+    if not found:
+        return None
+    # fvs is a list of (field, value) tuples — convert to dict.
+    return dict(fvs)
+
+
+def write_result(tbl, uuid, state, exit_code, output):
+    """
+    Write the final job result back to the hash via Table.set().
+
+    Table.set(key, fvs) maps to Redis HMSET on the full key
+    "JMD_CMD|<uuid>".  fvs is a FieldValuePairs (list of tuples).
+
+    Args:
+        tbl:       swsscommon.Table instance
+        uuid:      Job UUID string
+        state:     "COMPLETE" or "FAILED"
+        exit_code: Integer return code
+        output:    Combined stdout + stderr string
+    """
+    log_info("setting state={} exit_code={} on JMD_CMD|{}".format(
+        state, exit_code, uuid))
+    fvs = [
+        ("exit_code",   str(exit_code)),
+        ("state",       state),
+        ("finished_at", rfc3339_now()),
+        ("output",      output),
+    ]
+    tbl.set(uuid, fvs)
+
+
+def atomic_claim(uuid):
+    """
+    Atomically transition state from READY -> INPROGRESS.
+
+    Uses WATCH/MULTI/EXEC on a raw redis-py client to guarantee that
+    no two workers can claim the same job.  We use raw redis-py here
+    because the swsscommon C++ binding does not expose Redis
+    transactions.
+
+    If the key was modified between WATCH and EXEC, redis-py raises
+    WatchError and the transaction is aborted.
+
+    Args:
+        uuid: Job UUID string
+
+    Returns:
+        True if this worker successfully claimed the job, False otherwise.
+    """
+    # Build the full Redis key (Table adds the separator automatically,
+    # but the raw client needs the full key).
+    key = "JMD_CMD|{}".format(uuid)
+
+    # Open a raw redis-py connection to STATE_DB.
+    raw = redis.Redis(unix_socket_path=REDIS_UNIX_SOCK, db=STATE_DB_ID,
+                      decode_responses=True)
+
+    try:
+        with raw.pipeline() as p:
+            # WATCH the key — if any client modifies it before EXEC,
+            # the transaction aborts (raises WatchError).
+            p.watch(key)
+
+            # After watch(), the pipeline is in immediate-execution mode,
+            # so hget() runs right away and returns the current value.
+            current_state = p.hget(key, "state")
+
+            if current_state != "READY":
+                # Job already claimed, completed, or missing.
+                p.unwatch()
+                return False
+
+            # Switch to buffered/transactional mode (MULTI).
+            p.multi()
+            p.hset(key, mapping={"state": "INPROGRESS"})
+
+            # EXEC — if the key changed since WATCH, raises WatchError.
+            p.execute()
+            return True
+
+    except redis.WatchError:
+        # Another worker modified the key between WATCH and EXEC.
+        # Expected under concurrency — not an error.
+        log_info("WatchError on {}; another worker claimed it".format(key))
+        return False
+    except Exception as e:
+        log_err("atomic_claim failed on {}: {}".format(key, e))
+        return False
+    finally:
+        raw.close()
+
+
+# ---------------------------------------------------------------------------
+# Command execution
+# ---------------------------------------------------------------------------
+
+def run_cmd(cmd, timeout_s):
+    """
+    Execute a shell command and return (exit_code, combined_output).
+
+    stdout and stderr are captured separately, then merged with a
+    clear separator.
+
+    Args:
+        cmd:       Command string (passed to /bin/sh -c via shell=True).
+        timeout_s: Max wall-clock seconds before the child is killed.
+
+    Returns:
+        Tuple of (int return_code, str combined_output).
+
+    Raises:
+        subprocess.TimeoutExpired if the command exceeds timeout_s.
+    """
+    # POC: shell=True for maximum flexibility.
+    # Hardening TODO: switch to an explicit argv allowlist + shell=False.
+    p = subprocess.run(
+        cmd,
+        shell=True,
+        capture_output=True,   # captures stdout and stderr separately
+        text=True,             # decode output as UTF-8 strings
+        timeout=timeout_s,
+    )
+    out = p.stdout or ""
+    err = p.stderr or ""
+
+    # Merge stderr below stdout with a clear separator so consumers
+    # can distinguish the two streams.
+    if err:
+        out = "{}\n--- stderr ---\n{}".format(out, err) if out else "--- stderr ---\n{}".format(err)
+
+    return p.returncode, out
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    """
+    Worker main — parse args, connect to Redis, claim job, run, record result.
+
+    Follows the standard SONiC daemon pattern:
+      1. Register signal handlers
+      2. Connect to DB via DBConnector
+      3. Do work
+      4. Exit
+    """
+    # -- Signal handling (standard SONiC convention) --------------------------
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT,  signal_handler)
+
+    syslog.openlog(LOGTAG, syslog.LOG_PID)
+
+    # -- Parse arguments ------------------------------------------------------
+    ap = argparse.ArgumentParser(
+        description="Short-lived per-UUID worker for JMD commands"
+    )
+    ap.add_argument("--uuid",    required=True,
+                    help="Job UUID from JMD_CMD_EVENTS stream")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                    help="Max seconds for command execution (default {})".format(
+                        DEFAULT_TIMEOUT))
+    args = ap.parse_args()
+
+    # -- Verify swsscommon is available ---------------------------------------
+    if not HAS_SWSSCOMMON:
+        log_err("swsscommon module not available; cannot run command")
+        syslog.closelog()
+        return 3
+
+    # redis-py is needed for WATCH/MULTI/EXEC in atomic_claim
+    if redis is None:
+        log_err("redis-py module not installed; cannot run command")
+        syslog.closelog()
+        return 3
+
+    log_info("start uuid={} timeout={}s".format(args.uuid, args.timeout))
+
+    # -- Connect to STATE_DB via DBConnector -----------------------------------
+    try:
+        state_db = DBConnector(STATE_DB_NAME, 0)
+        tbl = Table(state_db, TABLE_NAME)
+        log_info("connected to STATE_DB via DBConnector + Table('{}')".format(
+            TABLE_NAME))
+    except Exception as e:
+        log_err("cannot connect to STATE_DB: {}".format(e))
+        syslog.closelog()
+        return 3
+
+    # -- Load job fields from hash -------------------------------------------
+    fields = get_job_fields(tbl, args.uuid)
+
+    if not fields:
+        # Key doesn't exist (expired TTL, wrong UUID, etc.)
+        log_err("{}: hash key JMD_CMD|{} not found in STATE_DB".format(
+            args.uuid, args.uuid))
+        syslog.closelog()
+        return 2
+
+    # Table returns decoded strings — no bytes decoding needed.
+    cmd = fields.get("command_text", "")
+    if not cmd:
+        log_err("{}: missing or empty command_text field".format(args.uuid))
+        syslog.closelog()
+        return 2
+
+    current_state = fields.get("state", "(none)")
+
+    # Truncate the command preview for log readability (max 160 chars).
+    preview = cmd if len(cmd) < 160 else cmd[:160] + "..."
+    log_info("{}: state={} will run: {}".format(args.uuid, current_state, preview))
+
+    # -- Atomic claim: READY -> INPROGRESS -----------------------------------
+    # Uses raw redis-py for WATCH/MULTI/EXEC (swsscommon doesn't expose
+    # transactions).  If another worker already claimed this UUID, exit
+    # cleanly (rc 0).
+    log_info("{}: attempting claim".format(args.uuid))
+    if not atomic_claim(args.uuid):
+        log_info("{}: not READY (state={}); exiting".format(
+            args.uuid, current_state))
+        syslog.closelog()
+        return 0
+
+    log_info("{}: claimed; state set to INPROGRESS".format(args.uuid))
+
+    # -- Execute command and record result -----------------------------------
+    try:
+        log_info("{}: running command (timeout={}s)".format(args.uuid, args.timeout))
+        start = time.monotonic()
+        rc, combined = run_cmd(cmd, args.timeout)
+        dur_ms = int((time.monotonic() - start) * 1000)
+
+        # Record the result.  state = COMPLETE when rc == 0, else FAILED.
+        state = "COMPLETE" if rc == 0 else "FAILED"
+        write_result(tbl, args.uuid, state, rc, combined)
+        log_info("{}: done rc={} bytes={} dur={}ms".format(
+            args.uuid, rc, len(combined), dur_ms))
+        syslog.closelog()
+        return 0
+
+    except subprocess.TimeoutExpired:
+        # Child exceeded --timeout seconds.  Record FAILED with exit_code 124
+        # (matching the coreutils `timeout` convention).
+        write_result(tbl, args.uuid, "FAILED", 124, "(timeout)")
+        log_err("{}: timeout after {}s".format(args.uuid, args.timeout))
+        syslog.closelog()
+        return 124
+
+    except Exception as e:
+        # Catch-all for unexpected errors (Redis lost mid-run, permission
+        # errors, etc.).  exit_code 127 = "worker-level error".
+        write_result(tbl, args.uuid, "FAILED", 127, "error: {}".format(e))
+        log_err("{}: error {}".format(args.uuid, e))
+        syslog.closelog()
+        return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

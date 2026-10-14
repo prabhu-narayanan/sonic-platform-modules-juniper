@@ -1,0 +1,6 @@
+libsaigearbox (1.0.0) stable; urgency=medium
+
+  * Initial packaging of the common PHY PAI library (EPDM + PAI + Agera +
+    Barchetta) as a single shared library.
+
+ -- Juniper Networks <sonic@juniper.net>  Wed, 22 Jul 2026 00:00:00 +0000

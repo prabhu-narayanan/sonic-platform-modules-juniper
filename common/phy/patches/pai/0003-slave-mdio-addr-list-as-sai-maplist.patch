@@ -1,0 +1,99 @@
+PAI 4.0 for QFX5120-48T-6C (BCM84894 "blackfin" copper gearbox).
+
+Read SAI_SWITCH_ATTR_SLAVE_MDIO_ADDR_LIST as a map list.
+
+The attribute is declared sai_u8_list_t upstream, which caps a slave entry at
+eight bits and so cannot describe an MDIO address space larger than 255. It is
+redeclared sai_map_list_t by
+
+  sonic-juniper: patches/sonic-sairedis-sai/0001-change-slave-mdio-atrr-type.patch
+
+so that each entry carries a 32-bit key and value: the key is the logical SONiC
+phy id and the value the physical MDIO address.
+
+sairedis serialises the attribute according to that declaration, so PAI has to
+read the same shape. Left reading u8list it walks the sai_map_t array as raw
+bytes and derives nonsense addresses -- on QFX5120 the first slave of the
+0x0 domain came out as MDIO 48, and the broadcast core reset then failed with
+"Invalid PHY".
+
+Widen brcm_slave_phyid_list_t to uint32_t for the same reason the attribute was
+widened, and take the address from the map value in the create path and return
+it there in the get path.
+
+--- a/inc/brcm_pai_db.h	2025-11-27 03:36:46.000000000 +0530
++++ b/inc/brcm_pai_db.h	2026-09-07 00:00:00.000000000 +0530
+@@ -77,8 +77,8 @@
+ 
+ typedef struct brcm_slave_phyid_list_s
+ {
+-    uint8_t count;
+-    uint8_t list[BRCM_MAX_PHY_ON_MDIO_BUS];
++    uint32_t count;
++    uint32_t list[BRCM_MAX_PHY_ON_MDIO_BUS];
+ } brcm_slave_phyid_list_t;
+ 
+ typedef struct _brcm_platform_ctxt_s {
+--- a/src/brcm_pai_switch.c	2025-11-27 03:36:46.000000000 +0530
++++ b/src/brcm_pai_switch.c	2026-09-07 00:00:00.000000000 +0530
+@@ -692,22 +692,26 @@
+                 switching_mode_configured = 1;
+                 break;
+             case SAI_SWITCH_ATTR_SLAVE_MDIO_ADDR_LIST:
+-                if (attr_list[attr_idx].value.u8list.count == 0 ||
+-                    attr_list[attr_idx].value.u8list.count > BRCM_MAX_PHY_ON_MDIO_BUS) {
++                if (attr_list[attr_idx].value.maplist.count == 0 ||
++                    attr_list[attr_idx].value.maplist.count > BRCM_MAX_PHY_ON_MDIO_BUS) {
+                     PAI_LOG_ERROR(SAI_API_SWITCH, "Invalid slave mdio address list count:%d\n",
+-                        attr_list[attr_idx].value.u8list.count);
++                        attr_list[attr_idx].value.maplist.count);
+                     return SAI_STATUS_INVALID_ATTR_VALUE_0 + attr_idx;
+                 }
+-                if (!attr_list[attr_idx].value.u8list.list) {
++                if (!attr_list[attr_idx].value.maplist.list) {
+                     PAI_LOG_ERROR(SAI_API_SWITCH, "Attribute list address is NULL\n");
+                     return SAI_STATUS_INVALID_ATTR_VALUE_0 + attr_idx;
+                 }
+-                phy_init.slave_phyid_list.count = attr_list[attr_idx].value.u8list.count;
++                phy_init.slave_phyid_list.count = attr_list[attr_idx].value.maplist.count;
+                 PAI_LOG_DEBUG(SAI_API_SWITCH, "Slave MDIO list count %d\n", phy_init.slave_phyid_list.count);
+ 
+                 for (idx = 0; idx < phy_init.slave_phyid_list.count; idx++) {
+-                    phy_init.slave_phyid_list.list[idx] = attr_list[attr_idx].value.u8list.list[idx];
+-                    PAI_LOG_DEBUG(SAI_API_SWITCH, "Slave MDIO list:[%d]:%x\n", idx, phy_init.slave_phyid_list.list[idx]);
++                    /* key is the logical SONiC phy id, value the physical MDIO
++                     * address; PAI addresses a slave by the latter. */
++                    phy_init.slave_phyid_list.list[idx] = attr_list[attr_idx].value.maplist.list[idx].value;
++                    PAI_LOG_DEBUG(SAI_API_SWITCH, "Slave MDIO list:[%d]:%x\n",
++                        attr_list[attr_idx].value.maplist.list[idx].key,
++                        phy_init.slave_phyid_list.list[idx]);
+                 }
+                 break;
+             case SAI_SWITCH_ATTR_FAILOVER_CONFIG_MODE:
+@@ -2291,20 +2295,20 @@
+                 attr_list[attr_idx].value.u64 = SAI_SWITCH_HARDWARE_ACCESS_BUS_MDIO;
+                 break;
+             case SAI_SWITCH_ATTR_SLAVE_MDIO_ADDR_LIST:
+-                if (attr_list[attr_idx].value.u8list.count == 0 ||
+-                    attr_list[attr_idx].value.u8list.count > BRCM_MAX_PHY_ON_MDIO_BUS) {
++                if (attr_list[attr_idx].value.maplist.count == 0 ||
++                    attr_list[attr_idx].value.maplist.count > BRCM_MAX_PHY_ON_MDIO_BUS) {
+                     PAI_LOG_ERROR(SAI_API_SWITCH, "Invalid slave mdio address list count:%d\n",
+-                        attr_list[attr_idx].value.u8list.count);
++                        attr_list[attr_idx].value.maplist.count);
+                     return SAI_STATUS_INVALID_ATTR_VALUE_0 + attr_idx;
+                 }
+-                if (!attr_list[attr_idx].value.u8list.list) {
++                if (!attr_list[attr_idx].value.maplist.list) {
+                     PAI_LOG_ERROR(SAI_API_SWITCH, "Attribute list address is NULL\n");
+                     return SAI_STATUS_INVALID_ATTR_VALUE_0 + attr_idx;
+                 }
+-                attr_list[attr_idx].value.u8list.count = phy_init.slave_phyid_list.count;
++                attr_list[attr_idx].value.maplist.count = phy_init.slave_phyid_list.count;
+ 
+                 for (array_idx = 0; array_idx < phy_init.slave_phyid_list.count; array_idx++) {
+-                    attr_list[attr_idx].value.u8list.list[array_idx] = phy_init.slave_phyid_list.list[array_idx];
++                    attr_list[attr_idx].value.maplist.list[array_idx].value = phy_init.slave_phyid_list.list[array_idx];
+                 }
+                 break;
+             case SAI_SWITCH_ATTR_MAX_NUMBER_OF_TEMP_SENSORS:

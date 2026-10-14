@@ -1,0 +1,131 @@
+PAI 4.0 for QFX5120-48T-6C (BCM84894 "blackfin" copper gearbox).
+
+Use the BCM84894 broadcast firmware download sequence on that part only.
+
+The vendor code drives a broadcast download with a single ascending walk of
+bcm_pm_firmware_broadcast_method_t, applying the master-prefixed PHY address
+on every pass. BCM84894 does not complete under that sequence: the domain
+performs its core reset over all twelve PHYs and then stalls, so
+create_switch() on the MDIO master never returns and orchagent times out.
+
+The Junos driver for this board, bcm_ext_epdm_phy_init() in
+junos/src/dcpfe/drivers/tvp_drv_bcm.c, performs six passes and does not use
+one address form throughout:
+
+  1. CoreReset        all PHYs   address: master_id_prefix | phy_id
+  2. Enable           all PHYs   address: phy_id
+  3. FirmwareExecute  master     address: master_id
+  4. CoreReset        all PHYs   address: master_id_prefix | phy_id
+  5. FirmwareVerify   master     address: master_id
+  6. End              all PHYs   address: phy_id
+
+It differs from the enum walk in three ways: only the core-reset passes carry
+the master prefix, the core reset is repeated after the firmware execute, and
+the firmware verify runs on the master alone rather than on every slave.
+
+Describe that as an explicit table -- method, whether the pass uses the
+master-prefixed address, and whether it is replayed for the slaves -- and take
+it only when BRCM_PAI_BFIN_SUPPORT(chip_name) holds. Agera3, Barchetta and
+every other family continue through the unmodified vendor loop, so this shared
+library behaves exactly as before on those parts.
+
+Measured on QFX5120-48T-6C: without this, create_switch() on the first master
+fails after the 60s sairedis timeout with only one core-reset pass visible in
+the driver log. With it, each of the four domains completes in about ten
+seconds and all 48 PHYs are created.
+
+--- a/src/brcm_pai_switch.c	2025-11-27 03:36:46.000000000 +0530
++++ b/src/brcm_pai_switch.c	2026-09-05 00:00:00.000000000 +0530
+@@ -485,6 +485,29 @@
+     return SAI_STATUS_SUCCESS;
+ }
+ 
++/*
++ * One pass of the BCM84894 broadcast firmware download sequence.
++ *
++ * master_prefixed selects the address form handed to the driver: the core
++ * reset passes address a PHY as <master_mdio << 16 | phy_mdio>, every other
++ * pass uses the bare MDIO address. apply_to_slaves is false for the passes the
++ * master performs on behalf of the whole broadcast domain.
++ */
++typedef struct brcm_pai_bcast_pass_s {
++    bcm_pm_firmware_broadcast_method_t method;
++    bool master_prefixed;
++    bool apply_to_slaves;
++} brcm_pai_bcast_pass_t;
++
++static const brcm_pai_bcast_pass_t brcm_pai_bfin_bcast_seq[] = {
++    { bcmpmFirmwareBroadcastCoreReset,       TRUE,  TRUE  },
++    { bcmpmFirmwareBroadcastEnable,          FALSE, TRUE  },
++    { bcmpmFirmwareBroadcastFirmwareExecute, FALSE, FALSE },
++    { bcmpmFirmwareBroadcastCoreReset,       TRUE,  TRUE  },
++    { bcmpmFirmwareBroadcastFirmwareVerify,  FALSE, FALSE },
++    { bcmpmFirmwareBroadcastEnd,             FALSE, TRUE  },
++};
++
+ /**
+  * @brief Create switch
+  *
+@@ -507,6 +530,7 @@
+     sai_status_t rv;
+     int attr_idx = 0, profile_id = 0, idx = 0, boot_type = BOOT_FLAGS_COLD;
+     int firmware_path_attr_idx = -1;
++    int bcast_pass_idx = 0;
+     bool switch_init = FALSE, bcast_enable = FALSE, bcast_execute = FALSE;
+     bool bcast_fw_verify = FALSE, bcast_disable = FALSE;
+     sai_switch_hardware_access_bus_t hw_access_type = 0;
+@@ -1117,6 +1141,46 @@
+ 
+         pai_memcpy(&slave_phy_info, &phy_info, sizeof(bcm_plp_access_t));
+ 
++        if (BRCM_PAI_BFIN_SUPPORT(phy_init.chip_name)) {
++            /* BCM84894 does not complete a broadcast download driven by a
++             * single ascending walk of the method enum: the core reset has to
++             * be repeated after the firmware execute, and only the core-reset
++             * passes take the master-prefixed address. Follow the sequence the
++             * Junos driver uses on this part (bcm_ext_epdm_phy_init() in
++             * tvp_drv_bcm.c). Other PHY families keep the vendor loop below. */
++            for (bcast_pass_idx = 0;
++                 bcast_pass_idx < (int)(sizeof(brcm_pai_bfin_bcast_seq) / sizeof(brcm_pai_bfin_bcast_seq[0]));
++                 bcast_pass_idx++) {
++                const brcm_pai_bcast_pass_t *bcast_pass = &brcm_pai_bfin_bcast_seq[bcast_pass_idx];
++
++                pai_plp_init_info.broadcast_method = bcast_pass->method;
++                phy_info.phy_addr = bcast_pass->master_prefixed ?
++                    (phy_init.master_port_id << MASTER_PORT_ID_SHIFT | phy_init.phy_id) :
++                    phy_init.phy_id;
++
++                rv = bcm_plp_phy_pai_info_get(chip_name, phy_info, &pai_info);
++                if (rv != SAI_STATUS_SUCCESS) {
++                    PAI_LOG_ERROR(SAI_API_SWITCH, "FAIL: Failed broadcast method %d for PHY-%d (ret = %d)!\n",
++                        bcast_pass->method, phy_info.phy_addr, rv);
++                    return brcm_epdm_err_to_pai(rv);
++                }
++                if (!bcast_pass->apply_to_slaves)
++                    continue;
++                for (attr_idx = 0; attr_idx < phy_init.slave_phyid_list.count; attr_idx++) {
++                    slave_phy_info.phy_addr = bcast_pass->master_prefixed ?
++                        (phy_init.master_port_id << MASTER_PORT_ID_SHIFT | phy_init.slave_phyid_list.list[attr_idx]) :
++                        phy_init.slave_phyid_list.list[attr_idx];
++                    rv = bcm_plp_phy_pai_info_get(chip_name, slave_phy_info, &pai_info);
++                    if (rv != SAI_STATUS_SUCCESS) {
++                        PAI_LOG_ERROR(SAI_API_SWITCH, "FAIL: Failed broadcast method %d for PHY-%d (ret = %d)!\n",
++                            bcast_pass->method, slave_phy_info.phy_addr, rv);
++                        return brcm_epdm_err_to_pai(rv);
++                    }
++                }
++            }
++            /* Restore the prefixed address for the init-config path below. */
++            phy_info.phy_addr = phy_init.master_port_id << MASTER_PORT_ID_SHIFT | phy_init.phy_id;
++        } else {
+         for (fw_bcast_method = bcmpmFirmwareBroadcastCoreReset; fw_bcast_method <= bcmpmFirmwareBroadcastEnd; fw_bcast_method++) {
+             pai_plp_init_info.broadcast_method = fw_bcast_method;
+             rv = bcm_plp_phy_pai_info_get(chip_name, phy_info, &pai_info);
+@@ -1139,6 +1203,7 @@
+                 }
+             }
+         }
++        }
+         for (attr_idx = 0; attr_idx < phy_init.slave_phyid_list.count; attr_idx++) {
+             slave_phy_init.phy_obj_id = BRCM_PAI_CREATE_OBJ_ID(SAI_OBJECT_TYPE_SWITCH,
+                 pai_atoi(phy_cfg_prop.part_number), 0, phy_init.slave_phyid_list.list[attr_idx]);

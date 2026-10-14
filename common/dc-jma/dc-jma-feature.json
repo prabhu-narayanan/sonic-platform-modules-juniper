@@ -1,0 +1,35 @@
+{
+    "FEATURE": {
+        "dc-jma": {
+            "state": "enabled",
+            "delayed": "False",
+            "has_global_scope": "True",
+            "has_per_asic_scope": "False",
+            "auto_restart": "enabled",
+            "support_syslog_rate_limit": "true",
+            "check_up_status": "false",
+            "high_mem_alert": "disabled",
+            "set_owner": "local"
+        }
+    },
+    "DC_JMA": {
+        "config": {
+            "epterm_ip": "10.87.95.11",
+            "sonic_mode": "true",
+            "log_level": "info"
+        }
+    },
+    "AUTO_TECHSUPPORT_FEATURE": {
+        "dc-jma": {
+            "state": "disabled",
+            "rate_limit_interval": "600",
+            "available_mem_threshold": "10.0"
+        }
+    },
+    "SYSLOG_CONFIG_FEATURE": {
+        "dc-jma": {
+            "rate_limit_interval": "300",
+            "rate_limit_burst": "20000"
+        }
+    }
+}

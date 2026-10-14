@@ -1,0 +1,17 @@
+[Unit]
+Description=PDDF module and device initialization service
+Before=pmon.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/python3 /usr/local/bin/qfx5241_platform_init.py
+ExecStart=/usr/local/bin/pddf_util.py install
+ExecStartPost=/usr/bin/python3 /usr/local/bin/qfx5241_post_pddf_init.py
+ExecStop=/usr/local/bin/pddf_util.py clean
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

@@ -20,6 +20,12 @@
 #define TMC_OPTIC_CPLD_MAJOR                    0x00104
 #define TMC_OPTIC_CPLD_MINOR                    0x00108
 
+#define XMC_OPTIC_CPLD1_MAJOR                   0x00194
+#define XMC_OPTIC_CPLD1_MINOR                   0x00198
+
+#define TXMC_OPTIC_CPLD2_MAJOR                  0x00224
+#define TXMC_OPTIC_CPLD2_MINOR                  0x00228
+
 /*
  * I2C Master Block
  */
@@ -28,6 +34,18 @@
 
 #define TMC_I2C_DPMEM_ENTRY_START                       0x10000
 #define TMC_I2C_DPMEM_ENTRY_END                         0x13FFC
+
+/*
+ *  SPI Block
+ */
+#define TMC_CHD_SPI_MASTER_SPI_CONTROL_START            0x1000
+#define TMC_CHD_SPI_MASTER_SPI_CONTROL_END              0x13FF
+
+/*
+ *  SPI Mem Block
+ */
+#define TMC_CHD_SPI_MEM_MEM_SPI_MEM_START               0x2000
+#define TMC_CHD_SPI_MEM_MEM_SPI_MEM_END                 0x27FF
 
 #define TMC_LED_CONTROL_START           0x58
 #define TMC_LED_CONTROL_END             0x5B
@@ -45,6 +63,9 @@
 /*
  * TMC GPIO SLAVE Block
  */
+#define TMC_GPIO_PLL_STATUS_START	0x30
+#define TMC_GPIO_PLL_STATUS_END		0x33
+
 #define TMC_GPIO_PTP_RESET_START	0x94
 #define TMC_GPIO_PTP_RESET_END		0x97
 
@@ -73,10 +94,46 @@
 #define TMC_GPIO_SFP_SLAVE1_END		0x34b
 
 /*
+ * XMC GPIO SLAVE Block
+ */
+#define XMC_GPIO_SLAVE0_START		0xf0
+#define XMC_GPIO_SLAVE0_END		0x17b
+
+#define XMC_GPIO_SLAVE1_START		0x180
+#define XMC_GPIO_SLAVE1_END		0x20b
+
+#define XMC_GPIO_EXT_DEV_RESET_START	0x94
+#define XMC_GPIO_EXT_DEV_RESET_END	0x97
+
+ /*
+ * TXMC GPIO SLAVE Block
+ */
+#define TXMC_GPIO_SLAVE0_START		0xf0
+#define TXMC_GPIO_SLAVE0_END		0x17f
+
+#define TXMC_GPIO_SLAVE1_START		0x180
+#define TXMC_GPIO_SLAVE1_END		0x1bf
+
+#define TXMC_GPIO_SLAVE2_START       0x220
+#define TXMC_GPIO_SLAVE2_END		0x3ff
+
+#define TXMC_GPIO_EXT_DEV_RESET_START	0x94
+#define TXMC_GPIO_EXT_DEV_RESET_END	0x97
+
+#define TXMC_GPIO_SFP_SLAVE1_START 0x1c0
+#define TXMC_GPIO_SFP_SLAVE1_END  0x1db
+
+/*
  * TMC PSU Block
  */
 #define TMC_PSU_START			0x240
 #define TMC_PSU_END			0x243
+
+/*
+ * TMC FAN Block
+ */
+#define TMC_FAN_START			0x0f4
+#define TMC_FAN_END			0x113
 
 /*
  * TMC SHUTDOWN REG
@@ -90,4 +147,26 @@
 #define TMC_GPIO_MUX_SLAVE_START		0x26c
 #define TMC_GPIO_MUX_SLAVE_END		0x26f
 
+/*
+ * TMC PTP CLK MUX Block
+ */
+#define TMC_GPIO_PTP_CLK_MUX_SLAVE_START		0x150
+#define TMC_GPIO_PTP_CLK_MUX_SLAVE_END		0x153
+
+/*
+ * TMC Primary CLK MUX Block
+ */
+#define TMC_GPIO_PRI_CLK_MUX_START		0x148
+#define TMC_GPIO_PRI_CLK_MUX_END		0x14b
+
+/*
+ * TMC Secondary CLK MUX Block
+ */
+#define TMC_GPIO_SEC_CLK_MUX_START		0x14c
+#define TMC_GPIO_SEC_CLK_MUX_END		0x14f
+
+/*
+ * Max supported optic CPLDs.
+ */
+#define OPTIC_CPLDS_MAX	2
 #endif /* __JNX_TMC_H__ */

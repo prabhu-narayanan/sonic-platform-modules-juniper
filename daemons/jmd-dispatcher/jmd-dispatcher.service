@@ -1,0 +1,20 @@
+# /lib/systemd/system/jmd-dispatcher.service
+[Unit]
+Description=JMD Redis Streams Dispatcher
+After=sonic.target
+Requires=sonic.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/jmd-dispatcher
+Environment=USE_SYSTEMD=1
+Environment=MAX_PROCS=8
+Restart=always
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=sonic.target

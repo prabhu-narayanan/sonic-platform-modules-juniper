@@ -15,60 +15,376 @@ export INSTALL_MOD_DIR:=extra
 
 PYTHON         ?= python3
 
-PACKAGE_PRE_NAME := sonic-platform-juniper
+PKG_PREFIX := sonic-platform-juniper
+COMMON_PACKAGE_NAME := sonic-platform-juniper-common
 KVERSION   ?= $(shell uname -r)
+#KVERSION   ?= 6.1.0-29-2-amd64
 KERNEL_SRC :=  /lib/modules/$(KVERSION)
-MOD_SRC_DIR:= $(shell pwd)
-MODULE_DIRS:= qfx5210 qfx5200
-MODULE_DIR := modules
-UTILS_DIR := utils
+
+MOD_SRC_DIR := $(shell pwd)
+MODULE_DIRS  ?= qfx5241
+UTILS_DIR   := utils
 SERVICE_DIR := service
-CONF_DIR := conf
+BUILD_DIR := build
+BUILD_WHEEL_DIR := $(BUILD_DIR)/pddf
+
+# Kernel module directory structure for build environment
+# QFX5241 is ODM hardware; its drivers come from the ODM (Accton) tree.
+KERN_MOD_DIR:= $(shell pwd)/kernel-modules
+KERN_MODULES:= accton-drivers
+
+PLATFORM_DESTDIR        := /usr/share/sonic/device
+PLATFORM_COMMON_DESTDIR := $(PLATFORM_DESTDIR)/x86_64-juniper_common
+
+# Device configuration files (pddf-device.json, pd-plugin.json, pddf_support)
+DEVICE_DIR   := $(MOD_SRC_DIR)/../../../device/juniper
+
+ALARMD_DIR   := $(MOD_SRC_DIR)/daemons/alarmd
+
+# Kernel module signing keys (from rules/config via environment)
+# These are set by the SONiC build system when SECURE_UPGRADE_MODE is enabled
+SIGN_KEY   ?= $(SECURE_UPGRADE_DEV_SIGNING_KEY)
+SIGN_CERT  ?= $(SECURE_UPGRADE_SIGNING_CERT)
+
+# Determine sign-file and extract-cert tool locations dynamically.
+# In Debian Trixie the kbuild package path may not match a simple major.minor derivation,
+# so search well-known locations in order of preference.
+SIGN_FILE  := $(or \
+  $(shell which sign-file 2>/dev/null), \
+  $(wildcard /usr/lib/linux-kbuild-$(KVERSION)/scripts/sign-file), \
+  $(wildcard /usr/lib/linux-kbuild-$(shell echo $(KVERSION) | cut -d. -f1).$(shell echo $(KVERSION) | cut -d. -f2)/scripts/sign-file), \
+  $(shell find /usr/lib/linux-kbuild-*/scripts -name sign-file 2>/dev/null | sort -V | tail -1), \
+  $(wildcard $(KERNEL_SRC)/build/scripts/sign-file) \
+)
+EXTRACT_CERT := $(or \
+  $(shell which extract-cert 2>/dev/null), \
+  $(wildcard /usr/lib/linux-kbuild-$(KVERSION)/certs/extract-cert), \
+  $(wildcard /usr/lib/linux-kbuild-$(shell echo $(KVERSION) | cut -d. -f1).$(shell echo $(KVERSION) | cut -d. -f2)/certs/extract-cert), \
+  $(shell find /usr/lib/linux-kbuild-*/certs -name extract-cert 2>/dev/null | sort -V | tail -1), \
+  $(wildcard $(KERNEL_SRC)/build/certs/extract-cert) \
+)
 
 %:
-	dh $@ --with python3 --buildsystem=pybuild
+	dh $@ --with systemd,python2,python3 --buildsystem=pybuild
 
 clean:
 	dh_testdir
 	dh_testroot
 	dh_clean
-
-build-arch build-indep: build
-
-build:
-	#make modules -C $(KERNEL_SRC)/build M=$(MODULE_SRC)
 	(for mod in $(MODULE_DIRS); do \
-		make modules -C $(KERNEL_SRC)/build M=$(MOD_SRC_DIR)/$${mod}/modules || exit 1; \
-		$(PYTHON) setup.py build; \
+	if [ -f $(MOD_SRC_DIR)/$${mod}/$(UTILS_DIR)/Makefile ]; then \
+		make -C $(MOD_SRC_DIR)/$${mod}/$(UTILS_DIR) clean || true; \
+	fi; \
 	done)
 
-binary: binary-arch binary-indep
-	# Nothing to do
+	(for mod in $(KERN_MODULES); do \
+		if [ -d $(KERN_MOD_DIR)/$${mod} ]; then \
+			make -C $(KERNEL_SRC)/build M=$(KERN_MOD_DIR)/$${mod} clean || true; \
+		fi; \
+	done)
 
-binary-arch: build
-	# Nothing to do
+
+build:
+	mkdir -p $(MOD_SRC_DIR)/$(BUILD_DIR)/drivers
+	(for mod in $(KERN_MODULES); do \
+		if [ -d $(KERN_MOD_DIR)/$${mod} ]; then \
+			make -C $(KERNEL_SRC)/build M=$(KERN_MOD_DIR)/$${mod} modules || exit 1; \
+			find $(KERN_MOD_DIR)/$${mod} -type f -name "*.ko" -exec cp {} $(MOD_SRC_DIR)/$(BUILD_DIR)/drivers/ \; ; \
+		fi; \
+	done)
+	$(MAKE) -C $(MOD_SRC_DIR)/common/$(UTILS_DIR)
+
+	(for mod in $(MODULE_DIRS); do \
+		$(MAKE) -C $(MOD_SRC_DIR)/$${mod}/$(UTILS_DIR); \
+	done)
+
+	mkdir -p $(MOD_SRC_DIR)/$(BUILD_WHEEL_DIR)
+	$(PYTHON) -m build $(MOD_SRC_DIR) --outdir $(MOD_SRC_DIR)/$(BUILD_WHEEL_DIR);
+	chmod +755 $(MOD_SRC_DIR)/$(BUILD_WHEEL_DIR)/*whl;
+
+	# Run device-level unit tests with coverage (skip with SKIP_PLATFORM_TEST=y)
+	@if [ "$${SKIP_PLATFORM_TEST}" != "y" ]; then \
+		echo "=== Running Juniper Broadcom platform unit tests ==="; \
+		DEVICE_DIR=$(DEVICE_DIR); \
+		FAILED=0; \
+		for test_dir in $$(find $$DEVICE_DIR -type d -name tests 2>/dev/null); do \
+			platform_dir=$$(dirname $$test_dir); \
+			if ls $$test_dir/test_*.py >/dev/null 2>&1; then \
+				echo "--- Running tests in $$platform_dir ---"; \
+				(cd $$platform_dir && $(PYTHON) -m pytest tests/) || FAILED=1; \
+			fi; \
+		done; \
+		echo "--- Running platform/broadcom/sonic-platform-modules-juniper tests ---"; \
+		(cd $(MOD_SRC_DIR) && $(PYTHON) -m pytest tests/) || FAILED=1; \
+		if [ $$FAILED -ne 0 ]; then \
+			echo "ERROR: One or more Juniper Broadcom platform unit tests failed"; \
+			exit 1; \
+		fi; \
+		echo "=== Juniper Broadcom platform unit tests passed ==="; \
+		echo "=== Checking unit test coverage (minimum 80%) ==="; \
+		COV_THRESHOLD=80; \
+		for d in $$(find $$DEVICE_DIR -type d -name tests -exec dirname {} \;) $(MOD_SRC_DIR); do \
+			if [ -f $$d/coverage.xml ]; then \
+				LABEL=$$(basename $$d); \
+				COV_PCT=$$($(PYTHON) -c "import xml.etree.ElementTree as ET; \
+					tree = ET.parse('$$d/coverage.xml'); \
+					print(round(float(tree.getroot().get('line-rate', 0)) * 100, 1))" 2>/dev/null); \
+				if [ -n "$$COV_PCT" ]; then \
+					COV_INT=$${COV_PCT%%.*}; \
+					if [ "$$COV_INT" -lt "$$COV_THRESHOLD" ] 2>/dev/null; then \
+						echo "WARNING: $$LABEL coverage is $${COV_PCT}%% which is below $${COV_THRESHOLD}%% threshold"; \
+					else \
+						echo "OK: $$LABEL coverage is $${COV_PCT}%%"; \
+					fi; \
+				fi; \
+			fi; \
+		done; \
+	else \
+		echo "=== Skipping Juniper Broadcom platform unit tests (SKIP_PLATFORM_TEST=y) ==="; \
+	fi
+
+	# Archive test/coverage artifacts so they survive the build
+	@echo "=== Archiving test artifacts ==="
+	@REPORT_DIR=$(MOD_SRC_DIR)/../../test-reports/platform-broadcom; \
+	rm -rf $$REPORT_DIR; \
+	mkdir -p $$REPORT_DIR; \
+	DEVICE_DIR=$(DEVICE_DIR); \
+	for d in $(MOD_SRC_DIR) $$(find $$DEVICE_DIR -type d -name tests -exec dirname {} \;); do \
+		LABEL=$$(basename $$d); \
+		if [ -f $$d/coverage.xml ]; then \
+			cp $$d/coverage.xml  $$REPORT_DIR/coverage-$$LABEL.xml; \
+		fi; \
+		if [ -f $$d/test-results.xml ]; then \
+			cp $$d/test-results.xml $$REPORT_DIR/test-results-$$LABEL.xml; \
+		fi; \
+		if [ -d $$d/htmlcov ]; then \
+			cp -r $$d/htmlcov $$REPORT_DIR/htmlcov-$$LABEL; \
+		fi; \
+	done; \
+	echo "Test reports archived to $$REPORT_DIR"
+
+	# Clean up test/coverage artifacts so they don't get packaged into the .deb
+	@echo "=== Cleaning up test artifacts ==="
+	@DEVICE_DIR=$(DEVICE_DIR); \
+	for d in $(MOD_SRC_DIR) $$(find $$DEVICE_DIR -type d -name tests -exec dirname {} \;); do \
+		rm -f  $$d/coverage.xml $$d/test-results.xml $$d/.coverage; \
+		rm -rf $$d/htmlcov $$d/.pytest_cache; \
+	done
+
+	# Sign kernel modules if SECURE_UPGRADE keys are available
+	@if [ -n "$(SIGN_KEY)" ] && [ -f "$(SIGN_KEY)" ] && [ -n "$(SIGN_CERT)" ] && [ -f "$(SIGN_CERT)" ]; then \
+		if [ -z "$(SIGN_FILE)" ] || [ ! -f "$(SIGN_FILE)" ]; then \
+			echo "WARNING: sign-file tool not found, skipping platform module signing"; \
+			echo "  Searched: SIGN_FILE=$(SIGN_FILE)"; \
+			echo "  Modules will be signed later by signing_kernel_modules.sh"; \
+			exit 0; \
+		fi; \
+		if [ -z "$(EXTRACT_CERT)" ] || [ ! -f "$(EXTRACT_CERT)" ]; then \
+			echo "WARNING: extract-cert tool not found, skipping platform module signing"; \
+			echo "  Searched: EXTRACT_CERT=$(EXTRACT_CERT)"; \
+			echo "  Modules will be signed later by signing_kernel_modules.sh"; \
+			exit 0; \
+		fi; \
+		echo "=== Signing Juniper platform kernel modules ==="; \
+		TMP_SIGN_DIR=$$(mktemp -d); \
+		trap "rm -rf $$TMP_SIGN_DIR" EXIT; \
+		cat $(SIGN_KEY) $(SIGN_CERT) > $$TMP_SIGN_DIR/combined-key.pem; \
+		$(EXTRACT_CERT) $$TMP_SIGN_DIR/combined-key.pem $$TMP_SIGN_DIR/sign-cert.x509; \
+		for ko in $$(find $(BUILD_DIR)/drivers -type f -name "*.ko"); do \
+			if [ -f "$$ko" ]; then \
+				echo "Signing: $$ko"; \
+				$(SIGN_FILE) sha512 $$TMP_SIGN_DIR/combined-key.pem $$TMP_SIGN_DIR/sign-cert.x509 $$ko || exit 1; \
+				if grep -q "~Module signature appended~" "$$ko"; then \
+					echo "  -> Signature verified"; \
+				else \
+					echo "ERROR: Module $$ko was not signed properly"; \
+					exit 1; \
+				fi; \
+			fi; \
+		done; \
+		rm -rf $$TMP_SIGN_DIR; \
+		echo "=== Juniper platform kernel modules signed successfully ==="; \
+	else \
+		echo "Skipping module signing (SECURE_UPGRADE keys not available)"; \
+		echo "  SIGN_KEY=$(SIGN_KEY)"; \
+		echo "  SIGN_CERT=$(SIGN_CERT)"; \
+	fi
+	# Build dc-jma Docker image (clone + docker build + docker save)
+	@INCLUDE_DC_JMA=$${INCLUDE_DC_JMA:-1}; \
+	if [ "$$INCLUDE_DC_JMA" = "1" ] || [ "$$INCLUDE_DC_JMA" = "y" ]; then \
+		echo "=== Building dc-jma Docker image ==="; \
+		$(MAKE) -C $(MOD_SRC_DIR)/common/dc-jma all || { \
+			echo "[dc-jma] Build failed"; \
+			exit 1; \
+		}; \
+	else \
+		echo "=== Skipping dc-jma build (INCLUDE_DC_JMA=$$INCLUDE_DC_JMA) ==="; \
+	fi
+
+# ---------------------------------------------------------------------------
+# Unit tests — run during dpkg-buildpackage (override dh_auto_test).
+# Tests are pure-Python (no HW needed) and use pytest with mock sysfs trees.
+# Skipped gracefully if pytest is not installed (e.g. minimal chroot).
+# ---------------------------------------------------------------------------
+override_dh_auto_test:
+	@echo "=== Running Juniper QFX5241 platform unit tests ==="
+	@if $(PYTHON) -m pytest --version >/dev/null 2>&1; then \
+		FAIL=0; \
+		PLAT_TEST_DIR=$(MOD_SRC_DIR)/qfx5241/tests; \
+		_ROOT=$$(p="$$(realpath $(MOD_SRC_DIR))"; while [ "$$p" != "/" ]; do \
+			if [ -d "$$p/device/juniper" ]; then echo "$$p"; break; fi; \
+			p=$$(dirname "$$p"); done); \
+		DEV_TEST_DIR=$$_ROOT/device/juniper/x86_64-juniper_qfx5241-r0/tests; \
+		for dir in $$PLAT_TEST_DIR $$DEV_TEST_DIR; do \
+			if [ -d "$$dir" ]; then \
+				echo "--- $$dir ---"; \
+				(cd $$dir && $(PYTHON) -m pytest --tb=short -q --cov --cov-report=term-missing) || FAIL=1; \
+			fi; \
+		done; \
+		if [ $$FAIL -eq 1 ]; then \
+			echo "WARNING: Unit tests failed — see output above"; exit 1; \
+		fi; \
+		echo "=== ALL TESTS PASSED ==="; \
+	else \
+		echo "WARNING: pytest not available, skipping unit tests"; \
+	fi
+
+# Debhelper/dpkg-buildpackage typically drives the sequence via build-arch/build-indep.
+# Ensure our custom build runs during the right phase so packaging (dh_install) sees
+# the generated artifacts (.ko modules, python wheels, utils).
+build-arch: build
+        # Nothing additional to do
+
+build-indep: build
+        # Nothing additional to do
+
+binary: binary-arch binary-indep
+        # Nothing to do
+
+binary-arch: build-arch
+        # Nothing to do
 
 #install: build
-	#dh_testdir
-	#dh_testroot
-	#dh_clean -k 
-	#dh_installdirs
+        #dh_testdir
+        #dh_testroot
+        #dh_clean -k 
+        #dh_installdirs
 
-binary-indep: build
+binary-indep: build-indep
 	dh_testdir
 	dh_installdirs
 
-	# Custom package commands
-	(for mod in $(MODULE_DIRS); do \
-		dh_installdirs -p$(PACKAGE_PRE_NAME)-$${mod} /$(KERNEL_SRC)/$(INSTALL_MOD_DIR); \
-		dh_installdirs -p$(PACKAGE_PRE_NAME)-$${mod} /usr/local/bin; \
-		dh_installdirs -p$(PACKAGE_PRE_NAME)-$${mod} /lib/systemd/system; \
-		cp $(MOD_SRC_DIR)/$${mod}/$(MODULE_DIR)/*.ko debian/$(PACKAGE_PRE_NAME)-$${mod}/$(KERNEL_SRC)/$(INSTALL_MOD_DIR); \
-		cp $(MOD_SRC_DIR)/$${mod}/$(UTILS_DIR)/* debian/$(PACKAGE_PRE_NAME)-$${mod}/usr/local/bin/; \
-		cp $(MOD_SRC_DIR)/$${mod}/$(SERVICE_DIR)/*.service debian/$(PACKAGE_PRE_NAME)-$${mod}/lib/systemd/system/; \
-		$(PYTHON) setup.py install --root=$(MOD_SRC_DIR)/debian/$(PACKAGE_PRE_NAME)-$${mod} --install-layout=deb; \
+	# ===== alarmd daemon (platform-agnostic alarm monitoring) =====
+	(for shared_pkg in $(COMMON_PACKAGE_NAME); do \
+		cp $(ALARMD_DIR)/scripts/alarmd debian/$${shared_pkg}/usr/local/bin/; \
+		chmod +x debian/$${shared_pkg}/usr/local/bin/alarmd; \
+		cp $(ALARMD_DIR)/alarmd.service debian/$${shared_pkg}/lib/systemd/system/; \
+		PYVER=$$($(PYTHON) -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"); \
+		ALARMD_PYDIR=debian/$${shared_pkg}/usr/lib/python$${PYVER}/dist-packages; \
+		mkdir -p $${ALARMD_PYDIR}/sonic_alarm; \
+		cp -r $(ALARMD_DIR)/sonic_alarm/* $${ALARMD_PYDIR}/sonic_alarm/; \
 	done)
-	# Resuming debhelper scripts
+
+	# ===== dc-jma container + jmd-dispatcher (Juniper Mist Agent) =====
+	if [ "$${INCLUDE_DC_JMA:-1}" = "1" ] || [ "$${INCLUDE_DC_JMA:-1}" = "y" ]; then \
+	(for shared_pkg in $(COMMON_PACKAGE_NAME); do \
+		dh_installdirs -p$${shared_pkg} /usr/share/sonic/docker-images; \
+		dh_installdirs -p$${shared_pkg} /etc/sonic; \
+		dh_installdirs -p$${shared_pkg} /config/mist/jma; \
+		if [ -f $(MOD_SRC_DIR)/common/dc-jma/docker-sonic-dc-jma.gz ]; then \
+			cp $(MOD_SRC_DIR)/common/dc-jma/docker-sonic-dc-jma.gz debian/$${shared_pkg}/usr/share/sonic/docker-images/; \
+		fi; \
+		cp $(MOD_SRC_DIR)/common/dc-jma/dc-jma.sh debian/$${shared_pkg}/usr/local/bin/; \
+		cp $(MOD_SRC_DIR)/common/dc-jma/dc-jma-init.sh debian/$${shared_pkg}/usr/local/bin/; \
+		cp $(MOD_SRC_DIR)/common/dc-jma/dc-jma-warm-reboot.sh debian/$${shared_pkg}/usr/local/bin/; \
+		cp $(MOD_SRC_DIR)/common/dc-jma/dc-jma-upgrade.sh debian/$${shared_pkg}/usr/local/bin/; \
+		cp $(MOD_SRC_DIR)/common/dc-jma/ensure_epterm.sh debian/$${shared_pkg}/usr/local/bin/; \
+		cp $(MOD_SRC_DIR)/common/dc-jma/dc-jma.service debian/$${shared_pkg}/lib/systemd/system/; \
+		cp $(MOD_SRC_DIR)/common/dc-jma/dc-jma-feature.json debian/$${shared_pkg}/etc/sonic/; \
+		cp $(MOD_SRC_DIR)/common/dc-jma/root_cert.pem debian/$${shared_pkg}/config/mist/jma/; \
+		dh_installdirs -p$${shared_pkg} /usr/local/yang-models; \
+		cp $(MOD_SRC_DIR)/common/dc-jma/sonic-dc-jma.yang debian/$${shared_pkg}/usr/local/yang-models/; \
+		cp $(MOD_SRC_DIR)/daemons/jmd-dispatcher/jmd-dispatcher debian/$${shared_pkg}/usr/local/bin/; \
+		cp $(MOD_SRC_DIR)/daemons/jmd-dispatcher/jmd-cmdrunner debian/$${shared_pkg}/usr/local/bin/; \
+		cp $(MOD_SRC_DIR)/daemons/jmd-dispatcher/jmd-dispatcher.service debian/$${shared_pkg}/lib/systemd/system/; \
+	done); \
+	fi
+
+	# Platform specific debian package
+	#
+	# NOTE: <plat>/service/pddf-platform-init.service is deliberately NOT copied into
+	# /lib/systemd/system below.  That path is owned by the upstream sonic-platform-pddf
+	# package, and shipping a second copy makes dpkg abort at install time with
+	#   trying to overwrite '/lib/systemd/system/pddf-platform-init.service',
+	#   which is also in package sonic-platform-pddf
+	# Each platform installs its own version into /etc/systemd/system via
+	# debian/sonic-platform-juniper-<plat>.install; systemd already prefers the unit in
+	# /etc over the vendor unit in /lib, so the override still wins.
+	#
+	# Which .ko each package gets is decided by debian/select-kos.sh: it seeds from
+	# the platform's pddf-device.json and then closes over the dependencies modinfo
+	# reports.  Seeding alone is not enough - the JSON lists what PDDF loads, never
+	# what a module links against - and copying everything is not acceptable either,
+	# as it puts other platforms' drivers in the package.  See that script for the
+	# full rationale.
+	(for mod in $(MODULE_DIRS); do \
+		pkg=$(PKG_PREFIX)-$${mod}; \
+		dh_installdirs -p$${pkg} /$(KERNEL_SRC)/$(INSTALL_MOD_DIR); \
+		dh_installdirs -p$${pkg} /usr/lib/sonic-platform-modules-juniper/drivers; \
+		dh_installdirs -p$${pkg} /usr/local/bin; \
+		dh_installdirs -p$${pkg} /lib/systemd/system; \
+		KOS=$$(find $(MOD_SRC_DIR)/$(BUILD_DIR)/drivers -name '*.ko' 2>/dev/null); \
+		if [ -z "$$KOS" ]; then echo "ERROR: No .ko files in $(BUILD_DIR)/drivers"; exit 1; fi; \
+		PDDF_JSON=$(DEVICE_DIR)/x86_64-juniper_$${mod}-r0/pddf/pddf-device.json; \
+		HWSKU_JSONS=$$(find $(DEVICE_DIR)/x86_64-juniper_$${mod}-r0/*/pddf/pddf-device.json 2>/dev/null | sort | tr '\n' ' '); \
+		WANT=$$(bash debian/select-kos.sh $(MOD_SRC_DIR)/$(BUILD_DIR)/drivers "$$PDDF_JSON" $$HWSKU_JSONS); \
+		if [ -z "$$WANT" ]; then echo "ERROR: select-kos.sh chose no modules for $${mod}"; exit 1; fi; \
+		echo "NOTE: $${pkg} ships $$(echo "$$WANT" | wc -l) modules"; \
+		for ko in $$WANT; do \
+			cp $$ko debian/$${pkg}/$(KERNEL_SRC)/$(INSTALL_MOD_DIR)/; \
+			cp $$ko debian/$${pkg}/usr/lib/sonic-platform-modules-juniper/drivers/; \
+		done; \
+		find $(MOD_SRC_DIR)/$${mod}/$(UTILS_DIR) -maxdepth 1 -type f -executable ! -name "*.c" ! -name "*.h" ! -name "Makefile" ! -name "README" -exec cp -t debian/$${pkg}/usr/local/bin/ {} +; \
+		rm -f debian/$${pkg}/usr/local/bin/pcimem; \
+		if [ -d $(MOD_SRC_DIR)/$${mod}/$(SERVICE_DIR) ]; then \
+			for svc in $(MOD_SRC_DIR)/$${mod}/$(SERVICE_DIR)/*.service; do \
+				if [ ! -f "$$svc" ]; then continue; fi; \
+				if [ "$$(basename $$svc)" = "pddf-platform-init.service" ]; then continue; fi; \
+				cp $$svc debian/$${pkg}/lib/systemd/system/; \
+			done; \
+			for dropin_dir in $(MOD_SRC_DIR)/$${mod}/$(SERVICE_DIR)/*.service.d; do \
+				if [ -d "$$dropin_dir" ]; then \
+					mkdir -p debian/$${pkg}/lib/systemd/system/$$(basename $$dropin_dir); \
+					cp $$dropin_dir/*.conf debian/$${pkg}/lib/systemd/system/$$(basename $$dropin_dir)/; \
+				fi; \
+			done; \
+		fi; \
+		PLAT_DEV_DIR=$(DEVICE_DIR)/x86_64-juniper_$${mod}-r0; \
+		PLAT_DESTDIR=$(PLATFORM_DESTDIR)/x86_64-juniper_$${mod}-r0; \
+		dh_installdirs -p$${pkg} $${PLAT_DESTDIR}/pddf; \
+		if [ -f $${PLAT_DEV_DIR}/pddf_support ]; then \
+			cp $${PLAT_DEV_DIR}/pddf_support debian/$${pkg}/$${PLAT_DESTDIR}/; \
+		fi; \
+		if [ -f $${PLAT_DEV_DIR}/pddf/pddf-device.json ]; then \
+			cp $${PLAT_DEV_DIR}/pddf/pddf-device.json debian/$${pkg}/$${PLAT_DESTDIR}/pddf/; \
+		fi; \
+		if [ -f $${PLAT_DEV_DIR}/pddf/pd-plugin.json ]; then \
+			cp $${PLAT_DEV_DIR}/pddf/pd-plugin.json debian/$${pkg}/$${PLAT_DESTDIR}/pddf/; \
+		fi; \
+		if [ -d $(MOD_SRC_DIR)/$${mod}/platform_impl ]; then \
+			cp -r $(MOD_SRC_DIR)/$${mod}/platform_impl debian/$${pkg}/$${PLAT_DESTDIR}/pddf/; \
+		fi; \
+		WHL=$$(ls $(MOD_SRC_DIR)/$(BUILD_WHEEL_DIR)/sonic_platform-*.whl 2>/dev/null | head -1); \
+		if [ -n "$$WHL" ]; then \
+			cp $$WHL debian/$${pkg}/$${PLAT_DESTDIR}/; \
+			cp $$WHL debian/$${pkg}/$${PLAT_DESTDIR}/pddf/; \
+		fi; \
+	done)
+
+	# ===== Python sonic_platform package =====
+	# X100: PDDF wheel is shipped via .install and installed by .postinst.
+	# No setup.py install needed — wheel handles everything.
+
 	dh_testroot
 	dh_install
 	dh_installchangelogs

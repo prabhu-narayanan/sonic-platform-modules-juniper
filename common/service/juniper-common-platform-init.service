@@ -1,0 +1,14 @@
+[Unit]
+Description=Juniper common platform initialization service
+Before=pmon.service pddf-platform-init.service
+After=sysinit.target
+DefaultDependencies=no
+
+[Service]
+ExecStart=/usr/local/bin/common_platform_init.py
+RemainAfterExit=yes
+StandardOutput=syslog+console
+StandardError=syslog+console
+
+[Install]
+WantedBy=multi-user.target

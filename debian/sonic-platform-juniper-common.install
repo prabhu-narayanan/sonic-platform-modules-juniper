@@ -1,0 +1,15 @@
+common/utils/common_platform_init.py usr/local/bin
+common/utils/pcimem usr/local/bin
+common/utils/pddf_pre_device_create.sh usr/local/bin
+common/utils/pddf_post_driver_install.sh usr/local/bin
+common/utils/pddf_post_driver_install.py usr/local/bin
+common/utils/juniper_config_migrate.py usr/local/bin
+common/config-setup/70-juniper-config-migration etc/config-setup/config-migration-post-hooks.d/
+build/pddf/*whl usr/share/sonic/device/x86_64-juniper_common/
+common/service/juniper-common-platform-init.service etc/systemd/system
+daemons/psuStatusd/psuStatusd usr/local/bin
+daemons/psuStatusd/psuStatusd.service lib/systemd/system
+daemons/shutdownd/watch-container-shutdown.sh usr/local/bin
+daemons/shutdownd/container-shutdown-watcher.service lib/systemd/system
+daemons/monitord/resil_monitord usr/local/bin
+daemons/monitord/resil_monitord.service lib/systemd/system

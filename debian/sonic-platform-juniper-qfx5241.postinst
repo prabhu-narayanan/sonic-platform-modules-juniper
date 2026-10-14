@@ -1,0 +1,36 @@
+#!/bin/bash
+# Post-installation script for sonic-platform-juniper-qfx5241
+#
+# Uses pddf-platform-init.service.  The PDDF service runs
+# qfx5241_platform_init.py (pre-PDDF boot flag / EEPROM cache setup)
+# as ExecStartPre, then pddf_util.py install to load PDDF framework modules.
+#
+# Uses --no-block to avoid deadlock when dpkg runs inside rc.local
+# on first boot: the service has Before=pmon.service, so a synchronous
+# start would block waiting for pmon while rc.local hasn't finished.
+
+set -e
+
+case "$1" in
+    configure)
+        KMOD_SRC=/usr/lib/sonic-platform-modules-juniper/drivers
+        KMOD_DST=/lib/modules/$(uname -r)/extra
+        if [ -d "$KMOD_SRC" ]; then
+            mkdir -p "$KMOD_DST"
+            find "$KMOD_SRC" -name '*.ko' -exec cp {} "$KMOD_DST/" \;
+        fi
+        depmod -a || true
+        # Ensure platform init scripts are executable
+        chmod +x /usr/local/bin/qfx5241_platform_init.py 2>/dev/null || true
+        chmod +x /usr/local/bin/qfx5241_post_pddf_init.py 2>/dev/null || true
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload
+            systemctl enable pddf-platform-init.service || true
+            systemctl start --no-block pddf-platform-init.service || true
+        fi
+        ;;
+esac
+     
+#DEBHELPER#
+
+exit 0

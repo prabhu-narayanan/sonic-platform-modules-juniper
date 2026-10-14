@@ -1,0 +1,12 @@
+# Juniper Platform - QFX5241-64 (Garnet) PDDF install file
+# Platform-specific utils and service
+qfx5241/utils/qfx5241_platform_init.py usr/local/bin
+qfx5241/utils/qfx5241_pre_device_create.py usr/local/bin
+qfx5241/utils/qfx5241_post_pddf_init.py usr/local/bin
+# Post-boot diagnostics
+qfx5241/utils/qfx5241_diag.py usr/local/bin
+qfx5241/service/pddf-platform-init.service etc/systemd/system
+# ee1004 would otherwise claim 0x36/0x37 on i2c-0 and block VRM5 on a mux channel
+qfx5241/conf/blacklist-ee1004.conf etc/modprobe.d/
+# Device JSONs, pddf_support marker, and sonic_platform wheel are installed
+# by the MODULE_DIRS loop in debian/rules (avoids ../.. paths outside source tree)

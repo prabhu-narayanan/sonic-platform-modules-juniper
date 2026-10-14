@@ -1,0 +1,194 @@
+#!/bin/bash
+#
+
+# /host/machine.conf is not present in the build chroot; source it only
+# when it exists so dpkg does not fail during image assembly.
+[ -f /host/machine.conf ] && . /host/machine.conf
+
+SRC_DIR=/usr/share/sonic/device/x86_64-juniper_common/
+WHEEL=$(ls "$SRC_DIR"/*.whl 2>/dev/null | head -n1)
+
+# Remove any pip-installed sonic_platform (e.g. DellEmc from the base image)
+# so that the version installed by setup.py into /usr/lib/python3/dist-packages/
+# takes priority.
+if pip3 show sonic_platform > /dev/null 2>&1; then
+    pip3 uninstall --root-user-action=ignore --yes sonic_platform
+fi
+
+if [ -f "$WHEEL" ]; then
+    pip3 install --root-user-action=ignore --no-deps "$WHEEL" --force-reinstall
+    if [ -n "$onie_platform" ] && [ -d "/usr/share/sonic/device/$onie_platform" ]; then
+        cp "$WHEEL" "/usr/share/sonic/device/$onie_platform/"
+    else
+        echo "warning: onie_platform unavailable; installed sonic_platform system-wide only"
+    fi
+else
+    echo "error: sonic_platform wheel not found in $SRC_DIR" >&2
+    exit 1
+fi
+
+if [ -z "$onie_platform" ]; then
+    exit 0
+fi
+
+
+# Ensure scripts are executable (dh_install may not preserve execute bits)
+for _bin in \
+    common_platform_init.py \
+    pddf_pre_device_create.sh \
+    pddf_post_driver_install.sh \
+    pddf_post_driver_install.py \
+    psuStatusd \
+    resil_monitord \
+    watch-container-shutdown.sh \
+    dc-jma.sh \
+    dc-jma-init.sh \
+    dc-jma-upgrade.sh \
+    dc-jma-warm-reboot.sh \
+    ensure_epterm.sh \
+    jmd-dispatcher \
+    jmd-cmdrunner; do
+    chmod +x /usr/local/bin/$_bin 2>/dev/null || true
+done
+
+systemctl enable juniper-common-platform-init.service
+systemctl start juniper-common-platform-init.service
+
+# There are primary and secondary bios in qfx5241 platform.
+# There is a problem with bios which prevents the OS booting from the
+# secondary bios when the OS was installed using primary bios.
+# Secondary bios fails to detect the UEFI partition. Right now
+# the workaround is to have a folder structure /EFI/BOOT/BOOT64x.efi
+#
+#
+#
+
+
+SONIC_VERSION=$(sonic-cfggen -y /etc/sonic/sonic_version.yml -v build_version)
+FIRST_BOOT_FILE="/host/image-${SONIC_VERSION}/platform/firsttime"
+
+if [ -f $FIRST_BOOT_FILE ]; then
+    mkdir /tmp/sda1
+    mount /dev/sda1 /tmp/sda1
+    cd /tmp/sda1/EFI
+    mkdir BOOT > /dev/null 2>&1
+    cp SONiC-OS/grubx64.efi BOOT/BOOTX64.EFI
+    cd /tmp
+    umount sda1
+    # This code block ensures that no additional entries
+    # are added. This is applicable during SONiC image
+    # upgrades.
+    entries=`efibootmgr -v | grep "BOOTX64"`
+    if [ -z "$entries" ]; then
+        # Creating the UEFI entry for the first time.
+        efibootmgr -c -L "SONiC" -l "\EFI\BOOT\BOOTX64.EFI" > /var/tmp/efi_log 2>&1
+    fi
+    mkdir /usr/bin/qfx5241-64od-warm-reboot
+    mkdir /usr/bin/qfx5241-64od-fast-reboot
+    cp /usr/bin/warm-reboot /usr/bin/qfx5241-64od-warm-reboot
+    cp /usr/bin/fast-reboot /usr/bin/qfx5241-64od-fast-reboot
+    cp /usr/local/bin/wrapper-warm-reboot /usr/bin/warm-reboot
+    cp /usr/local/bin/wrapper-fast-reboot /usr/bin/fast-reboot
+    cp /usr/share/sonic/device/x86_64-juniper_common/bin/* /usr/bin/
+    cp /usr/share/sonic/device/x86_64-juniper_qfx5241-r0/bin/* /usr/bin/
+fi
+
+# ============================================================
+# dc-jma (Juniper Mist Agent) and jmd-dispatcher integration
+# ============================================================
+
+# Set executable permissions (dh_install doesn't preserve execute bits)
+chmod +x /usr/local/bin/dc-jma.sh 2>/dev/null || true
+chmod +x /usr/local/bin/dc-jma-init.sh 2>/dev/null || true
+chmod +x /usr/local/bin/dc-jma-warm-reboot.sh 2>/dev/null || true
+chmod +x /usr/local/bin/dc-jma-upgrade.sh 2>/dev/null || true
+chmod +x /usr/local/bin/ensure_epterm.sh 2>/dev/null || true
+chmod +x /usr/local/bin/jmd-dispatcher 2>/dev/null || true
+chmod +x /usr/local/bin/jmd-cmdrunner 2>/dev/null || true
+
+# Set executable permissions for Juniper platform daemons
+chmod +x /usr/local/bin/psuStatusd 2>/dev/null || true
+chmod +x /usr/local/bin/watch-container-shutdown.sh 2>/dev/null || true
+chmod +x /usr/local/bin/resil_monitord 2>/dev/null || true
+
+# Add epterm entry to /etc/hosts
+/usr/local/bin/ensure_epterm.sh 2>/dev/null || true
+
+# Load dc-jma Docker image if present
+DC_JMA_IMAGE="/usr/share/sonic/docker-images/docker-sonic-dc-jma.gz"
+if [ -f "$DC_JMA_IMAGE" ]; then
+    echo "Loading dc-jma Docker image..."
+    docker load -i "$DC_JMA_IMAGE" 2>/dev/null || echo "Warning: Failed to load dc-jma image"
+fi
+
+# Create jma config directory
+mkdir -p /config/mist/jma
+
+# Add the default root CA certificate if it is missing
+if [ ! -f /config/mist/jma/root_cert.pem ] && [ -f /usr/local/share/dc-jma/root_cert.pem ]; then
+    cp -f /usr/local/share/dc-jma/root_cert.pem /config/mist/jma/root_cert.pem
+fi
+# systemctl enable would fail.  Use deb-systemd-helper as fallback.
+for _svc in jmd-dispatcher.service dc-jma.service psuStatusd.service container-shutdown-watcher.service resil_monitord.service; do
+    [ -f "/lib/systemd/system/$_svc" ] || continue
+    if [ -d /run/systemd/system ]; then
+        systemctl enable "$_svc" 2>/dev/null || true
+    elif command -v deb-systemd-helper >/dev/null 2>&1; then
+        deb-systemd-helper enable "$_svc" 2>/dev/null || true
+    else
+        mkdir -p /etc/systemd/system/sonic.target.wants
+        ln -sf "/lib/systemd/system/$_svc" \
+            "/etc/systemd/system/sonic.target.wants/$_svc" 2>/dev/null || true
+    fi
+done
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    # Clear any stale failed state (e.g. from a prior purge that removed
+    # the unit file while the service was running) then start both services.
+    # --no-block avoids blocking dpkg if the service takes time to start.
+    for _svc in jmd-dispatcher.service dc-jma.service psuStatusd.service container-shutdown-watcher.service resil_monitord.service; do
+        [ -f "/lib/systemd/system/$_svc" ] || continue
+        systemctl reset-failed "$_svc" 2>/dev/null || true
+        systemctl start --no-block "$_svc" 2>/dev/null || true
+    done
+fi
+
+# Merge dc-jma feature configuration into init_cfg.json
+DC_JMA_FEATURE_JSON="/etc/sonic/dc-jma-feature.json"
+INIT_CFG="/etc/sonic/init_cfg.json"
+
+if [ -f "$DC_JMA_FEATURE_JSON" ] && [ -f "$INIT_CFG" ]; then
+    if command -v jq >/dev/null 2>&1; then
+        cp "$INIT_CFG" "${INIT_CFG}.bak-dc-jma"
+        jq -s '.[0] * .[1]' "${INIT_CFG}.bak-dc-jma" "$DC_JMA_FEATURE_JSON" > "${INIT_CFG}.new" 2>/dev/null
+        if [ -s "${INIT_CFG}.new" ] && jq empty "${INIT_CFG}.new" 2>/dev/null; then
+            mv "${INIT_CFG}.new" "$INIT_CFG"
+            echo "Merged dc-jma feature into init_cfg.json"
+        else
+            echo "Warning: jq merge failed, keeping original init_cfg.json"
+            rm -f "${INIT_CFG}.new"
+        fi
+    fi
+elif [ -f "$DC_JMA_FEATURE_JSON" ] && [ ! -f "$INIT_CFG" ]; then
+    cp "$DC_JMA_FEATURE_JSON" "$INIT_CFG"
+fi
+
+# For upgrades: add dc-jma to running CONFIG_DB if accessible
+if [ -f "$DC_JMA_FEATURE_JSON" ] && command -v redis-cli >/dev/null 2>&1; then
+    if redis-cli -n 4 PING 2>/dev/null | grep -q PONG; then
+        if ! redis-cli -n 4 EXISTS "FEATURE|dc-jma" | grep -q "1"; then
+            redis-cli -n 4 HSET "FEATURE|dc-jma" \
+                "state" "enabled" \
+                "delayed" "False" \
+                "has_global_scope" "True" \
+                "has_per_asic_scope" "False" \
+                "auto_restart" "enabled" \
+                "support_syslog_rate_limit" "true" \
+                "check_up_status" "false" \
+                "high_mem_alert" "disabled" \
+                "set_owner" "local" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+
+echo "dc-jma integration complete"
